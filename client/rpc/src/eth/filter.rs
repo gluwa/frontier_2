@@ -32,7 +32,6 @@ use sc_transaction_pool::{ChainApi, Pool};
 use sc_transaction_pool_api::InPoolTransaction;
 use sp_api::ProvideRuntimeApi;
 use sp_blockchain::HeaderBackend;
-use sp_core::hashing::keccak_256;
 use sp_runtime::{
 	generic::BlockId,
 	traits::{Block as BlockT, NumberFor, One, Saturating, UniqueSaturatedInto},
@@ -343,7 +342,7 @@ where
 				if backend.is_indexed() {
 					let _ = filter_range_logs_indexed(
 						client.as_ref(),
-						backend.log_indexer(),
+						backend.as_ref(),
 						&block_data_cache,
 						&mut ret,
 						max_past_logs,
@@ -355,6 +354,7 @@ where
 				} else {
 					let _ = filter_range_logs(
 						client.as_ref(),
+						backend.as_ref(),
 						&block_data_cache,
 						&mut ret,
 						max_past_logs,
@@ -422,7 +422,7 @@ where
 		if backend.is_indexed() {
 			let _ = filter_range_logs_indexed(
 				client.as_ref(),
-				backend.log_indexer(),
+				backend.as_ref(),
 				&block_data_cache,
 				&mut ret,
 				max_past_logs,
@@ -434,6 +434,7 @@ where
 		} else {
 			let _ = filter_range_logs(
 				client.as_ref(),
+				backend.as_ref(),
 				&block_data_cache,
 				&mut ret,
 				max_past_logs,
@@ -487,7 +488,13 @@ where
 				.current_transaction_statuses(substrate_hash)
 				.await;
 			if let (Some(block), Some(statuses)) = (block, statuses) {
-				filter_block_logs(&mut ret, &filter, block, statuses);
+				let block_hash = backend
+					.rpc_compatible_hash_by_substrate_hash(&substrate_hash)
+					.await
+					.ok()
+					.flatten()
+					.unwrap_or_else(|| block.header.hash());
+				filter_block_logs(&mut ret, &filter, block_hash, block, statuses);
 			}
 		} else {
 			let best_number = client.info().best_number;
@@ -510,7 +517,7 @@ where
 			if backend.is_indexed() {
 				let _ = filter_range_logs_indexed(
 					client.as_ref(),
-					backend.log_indexer(),
+					backend.as_ref(),
 					&block_data_cache,
 					&mut ret,
 					max_past_logs,
@@ -522,6 +529,7 @@ where
 			} else {
 				let _ = filter_range_logs(
 					client.as_ref(),
+					backend.as_ref(),
 					&block_data_cache,
 					&mut ret,
 					max_past_logs,
@@ -538,7 +546,7 @@ where
 
 async fn filter_range_logs_indexed<B, C, BE>(
 	_client: &C,
-	backend: &dyn fc_api::LogIndexerBackend<B>,
+	backend: &dyn fc_api::Backend<B>,
 	block_data_cache: &EthBlockDataCacheTask<B>,
 	ret: &mut Vec<Log>,
 	max_past_logs: u32,
@@ -586,6 +594,7 @@ where
 	let time_prepare = timer_prepare.elapsed().as_millis();
 	let timer_fetch = Instant::now();
 	if let Ok(logs) = backend
+		.log_indexer()
 		.filter_logs(
 			UniqueSaturatedInto::<u64>::unique_saturated_into(from),
 			UniqueSaturatedInto::<u64>::unique_saturated_into(to),
@@ -602,7 +611,12 @@ where
 		for log in logs.iter() {
 			let substrate_hash = log.substrate_block_hash;
 
-			let ethereum_block_hash = log.ethereum_block_hash;
+			let ethereum_block_hash = backend
+				.rpc_compatible_hash_by_substrate_hash(&substrate_hash)
+				.await
+				.ok()
+				.flatten()
+				.unwrap_or(log.ethereum_block_hash);
 			let block_number = log.block_number;
 			let db_transaction_index = log.transaction_index;
 			let db_log_index = log.log_index;
@@ -681,6 +695,7 @@ where
 
 async fn filter_range_logs<B, C, BE>(
 	client: &C,
+	backend: &dyn fc_api::Backend<B>,
 	block_data_cache: &EthBlockDataCacheTask<B>,
 	ret: &mut Vec<Log>,
 	max_past_logs: u32,
@@ -727,7 +742,13 @@ where
 					.current_transaction_statuses(substrate_hash)
 					.await;
 				if let Some(statuses) = statuses {
-					filter_block_logs(ret, filter, block, statuses);
+					let block_hash = backend
+						.rpc_compatible_hash_by_substrate_hash(&substrate_hash)
+						.await
+						.ok()
+						.flatten()
+						.unwrap_or_else(|| block.header.hash());
+					filter_block_logs(ret, filter, block_hash, block, statuses);
 				}
 			}
 		}
@@ -756,12 +777,12 @@ where
 fn filter_block_logs<'a>(
 	ret: &'a mut Vec<Log>,
 	filter: &'a Filter,
+	block_hash: H256,
 	block: EthereumBlock,
 	transaction_statuses: Vec<TransactionStatus>,
 ) -> &'a Vec<Log> {
 	let params = FilteredParams::new(Some(filter.clone()));
 	let mut block_log_index: u32 = 0;
-	let block_hash = H256::from(keccak_256(&rlp::encode(&block.header)));
 	for status in transaction_statuses.iter() {
 		let mut transaction_log_index: u32 = 0;
 		let transaction_hash = status.transaction_hash;

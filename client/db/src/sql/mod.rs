@@ -31,7 +31,7 @@ use sqlx::{
 use sc_client_api::backend::{Backend as BackendT, StorageProvider};
 use sp_api::{ApiExt, ProvideRuntimeApi};
 use sp_blockchain::HeaderBackend;
-use sp_core::{H160, H256};
+use sp_core::{hashing::keccak_256, H160, H256};
 use sp_runtime::{
 	generic::BlockId,
 	traits::{Block as BlockT, Header as HeaderT, UniqueSaturatedInto, Zero},
@@ -102,6 +102,15 @@ pub struct Backend<Block> {
 	/// The number of allowed operations for the Sqlite filter call.
 	/// A value of `0` disables the timeout.
 	num_ops_timeout: i32,
+}
+
+fn rpc_compatible_block_hash(block: &ethereum::BlockV2, parent_hash: Option<H256>) -> H256 {
+	let mut header = block.header.clone();
+	if let Some(parent_hash) = parent_hash {
+		header.parent_hash = parent_hash;
+	}
+	header.timestamp /= 1000;
+	H256::from(keccak_256(&rlp::encode(&header)))
 }
 
 impl<Block> Backend<Block>
@@ -363,8 +372,9 @@ where
 	{
 		// Spawn a blocking task to get block metadata from substrate backend.
 		let storage_override = self.storage_override.clone();
+		let metadata_client = client.clone();
 		let metadata = tokio::task::spawn_blocking(move || {
-			Self::insert_block_metadata_inner(client.clone(), hash, &*storage_override)
+			Self::insert_block_metadata_inner(metadata_client, hash, &*storage_override)
 		})
 		.await
 		.map_err(|_| Error::Protocol("tokio blocking metadata task failed".to_string()))??;
@@ -378,6 +388,22 @@ where
 		let post_hashes = metadata.post_hashes;
 		let ethereum_block_hash = post_hashes.block_hash.as_bytes();
 		let substrate_block_hash = metadata.substrate_block_hash.as_bytes();
+		let rpc_compatible_block_hash =
+			if let Some(block) = self.storage_override.current_block(hash) {
+				if metadata.block_number == 0 {
+					Some(rpc_compatible_block_hash(&block, None))
+				} else if let Some(header) = client.header(hash).ok().flatten() {
+					self.rpc_compatible_hash_by_substrate_hash(header.parent_hash())
+						.await
+						.map_err(Error::Protocol)?
+						.map(|parent_hash| rpc_compatible_block_hash(&block, Some(parent_hash)))
+				} else {
+					None
+				}
+			} else {
+				None
+			}
+			.map(|hash| hash.as_bytes().to_owned());
 		let schema = metadata.schema.encode();
 		let block_number = metadata.block_number;
 		let is_canon = metadata.is_canon;
@@ -421,6 +447,19 @@ where
 			.await?;
 		}
 
+		if let Some(rpc_compatible_block_hash) = rpc_compatible_block_hash {
+			let _ = sqlx::query(
+				"INSERT OR IGNORE INTO rpc_compatible_blocks(
+						rpc_compatible_block_hash,
+						substrate_block_hash)
+					VALUES (?, ?)",
+			)
+			.bind(rpc_compatible_block_hash)
+			.bind(substrate_block_hash)
+			.execute(&mut *tx)
+			.await?;
+		}
+
 		sqlx::query("INSERT INTO sync_status(substrate_block_hash) VALUES (?)")
 			.bind(hash.as_bytes())
 			.execute(&mut *tx)
@@ -428,6 +467,67 @@ where
 
 		log::debug!(target: "frontier-sql", "[Metadata] Ready to commit");
 		tx.commit().await
+	}
+
+	/// Insert or backfill the RPC-compatible hash mapping for an existing block.
+	pub async fn insert_rpc_compatible_block_hash<Client, BE>(
+		&self,
+		client: Arc<Client>,
+		hash: H256,
+	) -> Result<(), Error>
+	where
+		Client: StorageProvider<Block, BE> + HeaderBackend<Block> + 'static,
+		BE: BackendT<Block> + 'static,
+	{
+		let Some(block) = self.storage_override.current_block(hash) else {
+			return Ok(());
+		};
+		let header = client
+			.header(hash)
+			.map_err(|err| Error::Protocol(format!("{err:?}")))?
+			.ok_or_else(|| Error::Protocol(format!("missing header for {hash:?}")))?;
+		let parent_hash = if header.number().is_zero() {
+			None
+		} else {
+			self.rpc_compatible_hash_by_substrate_hash(header.parent_hash())
+				.await
+				.map_err(Error::Protocol)?
+		};
+		if !header.number().is_zero() && parent_hash.is_none() {
+			return Ok(());
+		}
+
+		let rpc_compatible_block_hash = rpc_compatible_block_hash(&block, parent_hash)
+			.as_bytes()
+			.to_owned();
+		sqlx::query(
+			"INSERT OR IGNORE INTO rpc_compatible_blocks(
+					rpc_compatible_block_hash,
+					substrate_block_hash)
+				VALUES (?, ?)",
+		)
+		.bind(rpc_compatible_block_hash)
+		.bind(hash.as_bytes())
+		.execute(&self.pool)
+		.await?;
+
+		Ok(())
+	}
+
+	pub async fn rpc_compatible_hash_by_substrate_hash(
+		&self,
+		substrate_block_hash: &Block::Hash,
+	) -> Result<Option<H256>, String> {
+		let substrate_block_hash = substrate_block_hash.as_bytes();
+		let res = sqlx::query(
+			"SELECT rpc_compatible_block_hash FROM rpc_compatible_blocks WHERE substrate_block_hash = ? LIMIT 1",
+		)
+		.bind(substrate_block_hash)
+		.fetch_optional(&self.pool)
+		.await
+		.map_err(|err| err.to_string())?
+		.map(|row| H256::from_slice(&row.try_get::<Vec<u8>, _>(0).unwrap_or_default()[..]));
+		Ok(res)
 	}
 
 	/// Index the logs for the newly indexed blocks upto a `max_pending_blocks` value.
@@ -718,6 +818,15 @@ where
 					substrate_block_hash
 				)
 			);
+			CREATE TABLE IF NOT EXISTS rpc_compatible_blocks (
+				id INTEGER PRIMARY KEY,
+				rpc_compatible_block_hash BLOB NOT NULL,
+				substrate_block_hash BLOB NOT NULL UNIQUE,
+				UNIQUE (
+					rpc_compatible_block_hash,
+					substrate_block_hash
+				)
+			);
 			COMMIT;",
 		)
 		.execute(pool)
@@ -754,6 +863,12 @@ where
 				ethereum_block_hash,
 				ethereum_transaction_index
 			);
+			CREATE INDEX IF NOT EXISTS rpc_compatible_block_hash_idx ON rpc_compatible_blocks (
+				rpc_compatible_block_hash
+			);
+			CREATE INDEX IF NOT EXISTS rpc_compatible_substrate_hash_idx ON rpc_compatible_blocks (
+				substrate_block_hash
+			);
 			COMMIT;",
 		)
 		.execute(pool)
@@ -782,6 +897,33 @@ impl<Block: BlockT<Hash = H256>> fc_api::Backend<Block> for Backend<Block> {
 						.collect()
 				});
 		Ok(res)
+	}
+
+	async fn rpc_compatible_block_hash(
+		&self,
+		rpc_compatible_block_hash: &H256,
+	) -> Result<Option<Vec<Block::Hash>>, String> {
+		let rpc_compatible_block_hash = rpc_compatible_block_hash.as_bytes();
+		let res = sqlx::query(
+			"SELECT substrate_block_hash FROM rpc_compatible_blocks WHERE rpc_compatible_block_hash = ?",
+		)
+		.bind(rpc_compatible_block_hash)
+		.fetch_all(&self.pool)
+		.await
+		.ok()
+		.map(|rows| {
+			rows.iter()
+				.map(|row| H256::from_slice(&row.try_get::<Vec<u8>, _>(0).unwrap_or_default()[..]))
+				.collect()
+		});
+		Ok(res)
+	}
+
+	async fn rpc_compatible_hash_by_substrate_hash(
+		&self,
+		substrate_block_hash: &Block::Hash,
+	) -> Result<Option<H256>, String> {
+		Self::rpc_compatible_hash_by_substrate_hash(self, substrate_block_hash).await
 	}
 
 	async fn transaction_metadata(

@@ -39,6 +39,18 @@ pub trait Backend<Block: BlockT>: Send + Sync {
 		ethereum_block_hash: &H256,
 	) -> Result<Option<Vec<Block::Hash>>, String>;
 
+	/// Get the substrate hash with the given RPC-compatible ethereum block hash.
+	async fn rpc_compatible_block_hash(
+		&self,
+		rpc_compatible_block_hash: &H256,
+	) -> Result<Option<Vec<Block::Hash>>, String>;
+
+	/// Get the RPC-compatible ethereum block hash for the given substrate hash.
+	async fn rpc_compatible_hash_by_substrate_hash(
+		&self,
+		substrate_block_hash: &Block::Hash,
+	) -> Result<Option<H256>, String>;
+
 	/// Get the transaction metadata with the given ethereum block hash.
 	async fn transaction_metadata(
 		&self,

@@ -28,7 +28,11 @@ mod state;
 mod submit;
 mod transaction;
 
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
+use std::{
+	collections::BTreeMap,
+	marker::PhantomData,
+	sync::{Arc, Mutex},
+};
 
 use ethereum::{BlockV2 as EthereumBlock, TransactionV2 as EthereumTransaction};
 use ethereum_types::{H160, H256, H64, U256, U64};
@@ -88,6 +92,8 @@ pub struct Eth<B: BlockT, C, P, CT, BE, A: ChainApi, CIDP, EC> {
 	/// block.gas_limit * execute_gas_limit_multiplier
 	execute_gas_limit_multiplier: u64,
 	forced_parent_hashes: Option<BTreeMap<H256, H256>>,
+	rpc_compatible_hash_cache: Arc<Mutex<BTreeMap<H256, H256>>>,
+	rpc_compatible_reverse_hash_cache: Arc<Mutex<BTreeMap<H256, B::Hash>>>,
 	/// Something that can create the inherent data providers for pending state.
 	pending_create_inherent_data_providers: CIDP,
 	pending_consensus_data_provider: Option<Box<dyn pending::ConsensusDataProvider<B>>>,
@@ -136,6 +142,8 @@ where
 			fee_history_cache_limit,
 			execute_gas_limit_multiplier,
 			forced_parent_hashes,
+			rpc_compatible_hash_cache: Arc::new(Mutex::new(BTreeMap::new())),
+			rpc_compatible_reverse_hash_cache: Arc::new(Mutex::new(BTreeMap::new())),
 			pending_create_inherent_data_providers,
 			pending_consensus_data_provider,
 			_marker: PhantomData,
@@ -269,6 +277,8 @@ where
 			fee_history_cache_limit,
 			execute_gas_limit_multiplier,
 			forced_parent_hashes,
+			rpc_compatible_hash_cache,
+			rpc_compatible_reverse_hash_cache,
 			pending_create_inherent_data_providers,
 			pending_consensus_data_provider,
 			_marker: _,
@@ -289,6 +299,8 @@ where
 			fee_history_cache_limit,
 			execute_gas_limit_multiplier,
 			forced_parent_hashes,
+			rpc_compatible_hash_cache,
+			rpc_compatible_reverse_hash_cache,
 			pending_create_inherent_data_providers,
 			pending_consensus_data_provider,
 			_marker: PhantomData,
@@ -543,7 +555,7 @@ where
 	}
 }
 
-fn rich_block_build(
+pub(crate) fn rich_block_build(
 	block: EthereumBlock,
 	statuses: Vec<Option<TransactionStatus>>,
 	hash: Option<H256>,
@@ -551,9 +563,31 @@ fn rich_block_build(
 	base_fee: Option<U256>,
 	is_pending: bool,
 ) -> RichBlock {
+	rich_block_build_with_parent_hash(
+		block,
+		statuses,
+		hash,
+		full_transactions,
+		base_fee,
+		is_pending,
+		None,
+	)
+}
+
+pub(crate) fn rich_block_build_with_parent_hash(
+	block: EthereumBlock,
+	statuses: Vec<Option<TransactionStatus>>,
+	hash: Option<H256>,
+	full_transactions: bool,
+	base_fee: Option<U256>,
+	is_pending: bool,
+	parent_hash: Option<H256>,
+) -> RichBlock {
+	let rpc_header = rpc_compatible_header(&block, parent_hash);
+
 	let (hash, miner, nonce, total_difficulty) = if !is_pending {
 		(
-			Some(hash.unwrap_or_else(|| H256::from(keccak_256(&rlp::encode(&block.header))))),
+			Some(hash.unwrap_or_else(|| rpc_compatible_block_hash(&block, parent_hash))),
 			Some(block.header.beneficiary),
 			Some(block.header.nonce),
 			Some(U256::zero()),
@@ -561,26 +595,27 @@ fn rich_block_build(
 	} else {
 		(None, None, None, None)
 	};
+	let transaction_block_hash = hash;
 	Rich {
 		inner: Block {
 			header: Header {
 				hash,
-				parent_hash: block.header.parent_hash,
-				uncles_hash: block.header.ommers_hash,
-				author: block.header.beneficiary,
+				parent_hash: rpc_header.parent_hash,
+				uncles_hash: rpc_header.ommers_hash,
+				author: rpc_header.beneficiary,
 				miner,
-				state_root: block.header.state_root,
-				transactions_root: block.header.transactions_root,
-				receipts_root: block.header.receipts_root,
-				number: Some(block.header.number),
-				gas_used: block.header.gas_used,
-				gas_limit: block.header.gas_limit,
-				extra_data: Bytes(block.header.extra_data.clone()),
-				logs_bloom: block.header.logs_bloom,
-				timestamp: U256::from(block.header.timestamp / 1000),
-				difficulty: block.header.difficulty,
+				state_root: rpc_header.state_root,
+				transactions_root: rpc_header.transactions_root,
+				receipts_root: rpc_header.receipts_root,
+				number: Some(rpc_header.number),
+				gas_used: rpc_header.gas_used,
+				gas_limit: rpc_header.gas_limit,
+				extra_data: Bytes(rpc_header.extra_data.clone()),
+				logs_bloom: rpc_header.logs_bloom,
+				timestamp: U256::from(rpc_header.timestamp),
+				difficulty: rpc_header.difficulty,
 				nonce,
-				size: Some(U256::from(rlp::encode(&block.header).len() as u32)),
+				size: Some(U256::from(rlp::encode(&rpc_header).len() as u32)),
 			},
 			total_difficulty,
 			uncles: vec![],
@@ -597,6 +632,7 @@ fn rich_block_build(
 									Some(&block),
 									statuses[index].as_ref(),
 									base_fee,
+									transaction_block_hash,
 								)
 							})
 							.collect(),
@@ -618,11 +654,28 @@ fn rich_block_build(
 	}
 }
 
+pub(crate) fn rpc_compatible_block_hash(block: &EthereumBlock, parent_hash: Option<H256>) -> H256 {
+	H256::from(keccak_256(&rlp::encode(&rpc_compatible_header(
+		block,
+		parent_hash,
+	))))
+}
+
+fn rpc_compatible_header(block: &EthereumBlock, parent_hash: Option<H256>) -> ethereum::Header {
+	let mut header = block.header.clone();
+	if let Some(parent_hash) = parent_hash {
+		header.parent_hash = parent_hash;
+	}
+	header.timestamp /= 1000;
+	header
+}
+
 fn transaction_build(
 	ethereum_transaction: &EthereumTransaction,
 	block: Option<&EthereumBlock>,
 	status: Option<&TransactionStatus>,
 	base_fee: Option<U256>,
+	block_hash: Option<H256>,
 ) -> Transaction {
 	let pubkey = match public_key(ethereum_transaction) {
 		Ok(p) => Some(p),
@@ -658,7 +711,7 @@ fn transaction_build(
 	}
 
 	// Block hash.
-	transaction.block_hash = block.map(|block| block.header.hash());
+	transaction.block_hash = block_hash.or_else(|| block.map(|block| block.header.hash()));
 	// Block number.
 	transaction.block_number = block.map(|block| block.header.number);
 	// Transaction index.
