@@ -27,7 +27,6 @@ use sc_transaction_pool::ChainApi;
 use sc_transaction_pool_api::InPoolTransaction;
 use sp_api::{ApiExt, ProvideRuntimeApi};
 use sp_blockchain::HeaderBackend;
-use sp_core::hashing::keccak_256;
 use sp_runtime::traits::Block as BlockT;
 // Frontier
 use fc_rpc_core::types::*;
@@ -114,7 +113,7 @@ where
 				for txn in ethereum_transactions {
 					let inner_hash = txn.hash();
 					if hash == inner_hash {
-						return Ok(Some(transaction_build(&txn, None, None, None)));
+						return Ok(Some(transaction_build(&txn, None, None, None, None)));
 					}
 				}
 				// Unknown transaction.
@@ -125,16 +124,27 @@ where
 		let BlockInfo {
 			block,
 			statuses,
+			substrate_hash,
 			base_fee,
 			..
 		} = self.block_info_by_eth_block_hash(eth_block_hash).await?;
 		match (block, statuses) {
-			(Some(block), Some(statuses)) => Ok(Some(transaction_build(
-				&block.transactions[index],
-				Some(&block),
-				Some(&statuses[index]),
-				Some(base_fee),
-			))),
+			(Some(block), Some(statuses)) => {
+				let block_hash =
+					if let Some(block_hash) = self.rpc_compatible_hash(substrate_hash).await {
+						block_hash
+					} else {
+						let parent_hash = self.rpc_compatible_parent_hash(substrate_hash).await;
+						super::rpc_compatible_block_hash(&block, parent_hash)
+					};
+				Ok(Some(transaction_build(
+					&block.transactions[index],
+					Some(&block),
+					Some(&statuses[index]),
+					Some(base_fee),
+					Some(block_hash),
+				)))
+			}
 			_ => Ok(None),
 		}
 	}
@@ -145,23 +155,37 @@ where
 		index: Index,
 	) -> RpcResult<Option<Transaction>> {
 		let index = index.value();
+		let mut block_info = self.block_info_by_eth_block_hash(hash).await?;
+		if block_info.block.is_none() {
+			block_info = self.block_info_by_rpc_compatible_hash(hash).await?;
+		}
+
 		let BlockInfo {
 			block,
 			statuses,
+			substrate_hash,
 			base_fee,
 			..
-		} = self.block_info_by_eth_block_hash(hash).await?;
+		} = block_info;
 
 		match (block, statuses) {
 			(Some(block), Some(statuses)) => {
 				if let (Some(transaction), Some(status)) =
 					(block.transactions.get(index), statuses.get(index))
 				{
+					let block_hash =
+						if let Some(block_hash) = self.rpc_compatible_hash(substrate_hash).await {
+							block_hash
+						} else {
+							let parent_hash = self.rpc_compatible_parent_hash(substrate_hash).await;
+							super::rpc_compatible_block_hash(&block, parent_hash)
+						};
 					Ok(Some(transaction_build(
 						transaction,
 						Some(&block),
 						Some(status),
 						Some(base_fee),
+						Some(block_hash),
 					)))
 				} else {
 					Err(internal_err(format!("{:?} is out of bounds", index)))
@@ -180,6 +204,7 @@ where
 		let BlockInfo {
 			block,
 			statuses,
+			substrate_hash,
 			base_fee,
 			..
 		} = self.block_info_by_number(number).await?;
@@ -189,11 +214,19 @@ where
 				if let (Some(transaction), Some(status)) =
 					(block.transactions.get(index), statuses.get(index))
 				{
+					let block_hash =
+						if let Some(block_hash) = self.rpc_compatible_hash(substrate_hash).await {
+							block_hash
+						} else {
+							let parent_hash = self.rpc_compatible_parent_hash(substrate_hash).await;
+							super::rpc_compatible_block_hash(&block, parent_hash)
+						};
 					Ok(Some(transaction_build(
 						transaction,
 						Some(&block),
 						Some(status),
 						Some(base_fee),
+						Some(block_hash),
 					)))
 				} else {
 					Err(internal_err(format!("{:?} is out of bounds", index)))
@@ -218,7 +251,13 @@ where
 		} = block_info.clone();
 		match (block, statuses, receipts) {
 			(Some(block), Some(statuses), Some(receipts)) => {
-				let block_hash = H256::from(keccak_256(&rlp::encode(&block.header)));
+				let block_hash =
+					if let Some(block_hash) = self.rpc_compatible_hash(substrate_hash).await {
+						block_hash
+					} else {
+						let parent_hash = self.rpc_compatible_parent_hash(substrate_hash).await;
+						super::rpc_compatible_block_hash(&block, parent_hash)
+					};
 				let receipt = receipts[index].clone();
 
 				let (logs, logs_bloom, status_code, cumulative_gas_used, gas_used) =

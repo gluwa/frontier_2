@@ -100,6 +100,7 @@ where
 						let commitment = fc_db::kv::MappingCommitment::<B> {
 							block_hash: *substrate_block_hash,
 							ethereum_block_hash: *ethereum_block_hash,
+							rpc_compatible_block_hash: None,
 							ethereum_transaction_hashes: existing_transaction_hashes,
 						};
 
@@ -158,6 +159,7 @@ where
 						let commitment = fc_db::kv::MappingCommitment::<B> {
 							block_hash: *substrate_block_hash,
 							ethereum_block_hash: *ethereum_block_hash,
+							rpc_compatible_block_hash: None,
 							ethereum_transaction_hashes: existing_transaction_hashes,
 						};
 

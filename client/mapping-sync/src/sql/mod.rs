@@ -25,7 +25,7 @@ use sp_api::ProvideRuntimeApi;
 use sp_blockchain::{Backend, HeaderBackend};
 use sp_consensus::SyncOracle;
 use sp_core::H256;
-use sp_runtime::traits::{Block as BlockT, Header as HeaderT, UniqueSaturatedInto};
+use sp_runtime::traits::{Block as BlockT, Header as HeaderT, UniqueSaturatedInto, Zero};
 // Frontier
 use fp_rpc::EthereumRuntimeRPCApi;
 
@@ -286,8 +286,42 @@ async fn index_block_and_ancestors<Block, Backend, Client>(
 			break;
 		}
 
+		let header = blockchain_backend.header(hash).ok().flatten();
+		if let Some(header) = header.as_ref() {
+			let parent_hash = *header.parent_hash();
+			let parent_missing_compatible_hash = !header.number().is_zero()
+				&& indexer_backend
+					.rpc_compatible_hash_by_substrate_hash(&parent_hash)
+					.await
+					.ok()
+					.flatten()
+					.is_none();
+			if !header.number().is_zero()
+				&& (!indexer_backend.is_block_indexed(parent_hash).await
+					|| parent_missing_compatible_hash)
+			{
+				hashes.push(hash);
+				hashes.push(parent_hash);
+				continue;
+			}
+		}
+
 		// exit if block is already imported
 		if indexer_backend.is_block_indexed(hash).await {
+			if indexer_backend
+				.rpc_compatible_hash_by_substrate_hash(&hash)
+				.await
+				.ok()
+				.flatten()
+				.is_none()
+			{
+				let _ = indexer_backend
+					.insert_rpc_compatible_block_hash(client.clone(), hash)
+					.await
+					.map_err(|e| {
+						log::error!(target: "frontier-sql", "{e}");
+					});
+			}
 			log::debug!(target: "frontier-sql", "🔴 Block {hash:?} already imported");
 			break;
 		}
@@ -335,14 +369,64 @@ async fn index_canonical_block_and_ancestors<Block, Backend, Client>(
 
 		let status = indexer_backend.block_indexed_and_canon_status(hash).await;
 
+		let header = blockchain_backend.header(hash).ok().flatten();
+		if let Some(header) = header.as_ref() {
+			let parent_hash = *header.parent_hash();
+			let parent_status = indexer_backend
+				.block_indexed_and_canon_status(parent_hash)
+				.await;
+			let parent_missing_compatible_hash = !header.number().is_zero()
+				&& indexer_backend
+					.rpc_compatible_hash_by_substrate_hash(&parent_hash)
+					.await
+					.ok()
+					.flatten()
+					.is_none();
+			if !header.number().is_zero()
+				&& (!parent_status.indexed || parent_missing_compatible_hash)
+			{
+				hashes.push(hash);
+				hashes.push(parent_hash);
+				continue;
+			}
+		}
+
 		// exit if canonical block is already imported
 		if status.indexed && status.canon {
+			if indexer_backend
+				.rpc_compatible_hash_by_substrate_hash(&hash)
+				.await
+				.ok()
+				.flatten()
+				.is_none()
+			{
+				let _ = indexer_backend
+					.insert_rpc_compatible_block_hash(client.clone(), hash)
+					.await
+					.map_err(|e| {
+						log::error!(target: "frontier-sql", "{e}");
+					});
+			}
 			log::debug!(target: "frontier-sql", "🔴 Block {hash:?} already imported");
 			break;
 		}
 
 		// If block was previously indexed as non-canon then mark it as canon
 		if status.indexed && !status.canon {
+			if indexer_backend
+				.rpc_compatible_hash_by_substrate_hash(&hash)
+				.await
+				.ok()
+				.flatten()
+				.is_none()
+			{
+				let _ = indexer_backend
+					.insert_rpc_compatible_block_hash(client.clone(), hash)
+					.await
+					.map_err(|e| {
+						log::error!(target: "frontier-sql", "{e}");
+					});
+			}
 			if let Err(err) = indexer_backend.set_block_as_canon(hash).await {
 				log::error!(target: "frontier-sql", "Failed setting block {hash:?} as canon: {err:?}");
 				continue;

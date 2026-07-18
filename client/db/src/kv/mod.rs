@@ -49,12 +49,14 @@ pub struct DatabaseSettings {
 }
 
 pub(crate) mod columns {
-	pub const NUM_COLUMNS: u32 = 4;
+	pub const NUM_COLUMNS: u32 = 6;
 
 	pub const META: u32 = 0;
 	pub const BLOCK_MAPPING: u32 = 1;
 	pub const TRANSACTION_MAPPING: u32 = 2;
 	pub const SYNCED_MAPPING: u32 = 3;
+	pub const RPC_COMPATIBLE_BLOCK_MAPPING: u32 = 4;
+	pub const RPC_COMPATIBLE_SUBSTRATE_MAPPING: u32 = 5;
 }
 
 pub mod static_keys {
@@ -76,6 +78,22 @@ impl<Block: BlockT, C: HeaderBackend<Block>> fc_api::Backend<Block> for Backend<
 		ethereum_block_hash: &H256,
 	) -> Result<Option<Vec<Block::Hash>>, String> {
 		self.mapping().block_hash(ethereum_block_hash)
+	}
+
+	async fn rpc_compatible_block_hash(
+		&self,
+		rpc_compatible_block_hash: &H256,
+	) -> Result<Option<Vec<Block::Hash>>, String> {
+		self.mapping()
+			.rpc_compatible_block_hash(rpc_compatible_block_hash)
+	}
+
+	async fn rpc_compatible_hash_by_substrate_hash(
+		&self,
+		substrate_block_hash: &Block::Hash,
+	) -> Result<Option<H256>, String> {
+		self.mapping()
+			.rpc_compatible_hash_by_substrate_hash(substrate_block_hash)
 	}
 
 	async fn transaction_metadata(
@@ -248,6 +266,7 @@ impl<Block: BlockT> MetaDb<Block> {
 pub struct MappingCommitment<Block: BlockT> {
 	pub block_hash: Block::Hash,
 	pub ethereum_block_hash: H256,
+	pub rpc_compatible_block_hash: Option<H256>,
 	pub ethereum_transaction_hashes: Vec<H256>,
 }
 
@@ -275,6 +294,36 @@ impl<Block: BlockT> MappingDb<Block> {
 		{
 			Some(raw) => Ok(Some(
 				Vec::<Block::Hash>::decode(&mut &raw[..]).map_err(|e| format!("{:?}", e))?,
+			)),
+			None => Ok(None),
+		}
+	}
+
+	pub fn rpc_compatible_block_hash(
+		&self,
+		rpc_compatible_block_hash: &H256,
+	) -> Result<Option<Vec<Block::Hash>>, String> {
+		match self.db.get(
+			columns::RPC_COMPATIBLE_BLOCK_MAPPING,
+			&rpc_compatible_block_hash.encode(),
+		) {
+			Some(raw) => Ok(Some(
+				Vec::<Block::Hash>::decode(&mut &raw[..]).map_err(|e| format!("{:?}", e))?,
+			)),
+			None => Ok(None),
+		}
+	}
+
+	pub fn rpc_compatible_hash_by_substrate_hash(
+		&self,
+		substrate_block_hash: &Block::Hash,
+	) -> Result<Option<H256>, String> {
+		match self.db.get(
+			columns::RPC_COMPATIBLE_SUBSTRATE_MAPPING,
+			&substrate_block_hash.encode(),
+		) {
+			Some(raw) => Ok(Some(
+				H256::decode(&mut &raw[..]).map_err(|e| format!("{:?}", e))?,
 			)),
 			None => Ok(None),
 		}
@@ -336,6 +385,30 @@ impl<Block: BlockT> MappingDb<Block> {
 			&commitment.ethereum_block_hash.encode(),
 			&substrate_hashes.encode(),
 		);
+
+		if let Some(rpc_compatible_block_hash) = commitment.rpc_compatible_block_hash {
+			let substrate_hashes = match self.rpc_compatible_block_hash(&rpc_compatible_block_hash)
+			{
+				Ok(Some(mut data)) => {
+					if !data.contains(&commitment.block_hash) {
+						data.push(commitment.block_hash);
+					}
+					data
+				}
+				_ => vec![commitment.block_hash],
+			};
+
+			transaction.set(
+				columns::RPC_COMPATIBLE_BLOCK_MAPPING,
+				&rpc_compatible_block_hash.encode(),
+				&substrate_hashes.encode(),
+			);
+			transaction.set(
+				columns::RPC_COMPATIBLE_SUBSTRATE_MAPPING,
+				&commitment.block_hash.encode(),
+				&rpc_compatible_block_hash.encode(),
+			);
+		}
 
 		for (i, ethereum_transaction_hash) in commitment
 			.ethereum_transaction_hashes

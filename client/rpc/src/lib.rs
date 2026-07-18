@@ -249,6 +249,19 @@ pub mod frontier_backend_client {
 				}
 			}
 		}
+
+		let substrate_hashes = backend
+			.rpc_compatible_block_hash(&hash)
+			.await
+			.map_err(|err| internal_err(format!("fetch aux store failed: {:?}", err)))?;
+
+		if let Some(substrate_hashes) = substrate_hashes {
+			for substrate_hash in substrate_hashes {
+				if is_canon::<B, C>(client, substrate_hash) {
+					return Ok(Some(substrate_hash));
+				}
+			}
+		}
 		Ok(None)
 	}
 
@@ -440,6 +453,7 @@ mod tests {
 		let commitment = fc_db::kv::MappingCommitment::<OpaqueBlock> {
 			block_hash: b1_hash,
 			ethereum_block_hash,
+			rpc_compatible_block_hash: None,
 			ethereum_transaction_hashes: vec![],
 		};
 		let _ = backend.mapping().write_hashes(commitment);
@@ -472,6 +486,7 @@ mod tests {
 		let commitment = fc_db::kv::MappingCommitment::<OpaqueBlock> {
 			block_hash: b2_hash,
 			ethereum_block_hash,
+			rpc_compatible_block_hash: None,
 			ethereum_transaction_hashes: vec![],
 		};
 		let _ = backend.mapping().write_hashes(commitment);

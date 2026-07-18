@@ -29,6 +29,7 @@ use sc_client_api::backend::{Backend, StorageProvider};
 use sp_api::{ApiExt, ProvideRuntimeApi};
 use sp_blockchain::{Backend as _, HeaderBackend};
 use sp_consensus::SyncOracle;
+use sp_core::{hashing::keccak_256, H256};
 use sp_runtime::traits::{Block as BlockT, Header as HeaderT, Zero};
 // Frontier
 use fc_storage::StorageOverride;
@@ -43,18 +44,35 @@ pub fn sync_block<Block: BlockT, C: HeaderBackend<Block>>(
 	header: &Block::Header,
 ) -> Result<(), String> {
 	let substrate_block_hash = header.hash();
+	let rpc_compatible_parent_hash = if header.number().is_zero() {
+		None
+	} else {
+		backend
+			.mapping()
+			.rpc_compatible_hash_by_substrate_hash(header.parent_hash())?
+	};
+	let rpc_compatible_hash = |block: &ethereum::BlockV2| {
+		if header.number().is_zero() || rpc_compatible_parent_hash.is_some() {
+			Some(rpc_compatible_block_hash(block, rpc_compatible_parent_hash))
+		} else {
+			None
+		}
+	};
 	match fp_consensus::find_log(header.digest()) {
 		Ok(log) => {
-			let gen_from_hashes = |hashes: Hashes| -> fc_db::kv::MappingCommitment<Block> {
+			let gen_from_hashes = |hashes: Hashes,
+			                       block: Option<&ethereum::BlockV2>|
+			 -> fc_db::kv::MappingCommitment<Block> {
 				fc_db::kv::MappingCommitment {
 					block_hash: substrate_block_hash,
 					ethereum_block_hash: hashes.block_hash,
+					rpc_compatible_block_hash: block.and_then(rpc_compatible_hash),
 					ethereum_transaction_hashes: hashes.transaction_hashes,
 				}
 			};
-			let gen_from_block = |block| -> fc_db::kv::MappingCommitment<Block> {
-				let hashes = Hashes::from_block(block);
-				gen_from_hashes(hashes)
+			let gen_from_block = |block: ethereum::BlockV2| -> fc_db::kv::MappingCommitment<Block> {
+				let hashes = Hashes::from_block(block.clone());
+				gen_from_hashes(hashes, Some(&block))
 			};
 
 			match log {
@@ -64,7 +82,8 @@ pub fn sync_block<Block: BlockT, C: HeaderBackend<Block>>(
 				}
 				Log::Post(post_log) => match post_log {
 					PostLog::Hashes(hashes) => {
-						let mapping_commitment = gen_from_hashes(hashes);
+						let block = storage_override.current_block(substrate_block_hash);
+						let mapping_commitment = gen_from_hashes(hashes, block.as_ref());
 						backend.mapping().write_hashes(mapping_commitment)
 					}
 					PostLog::Block(block) => {
@@ -98,6 +117,15 @@ pub fn sync_block<Block: BlockT, C: HeaderBackend<Block>>(
 	}
 }
 
+fn rpc_compatible_block_hash(block: &ethereum::BlockV2, parent_hash: Option<H256>) -> H256 {
+	let mut header = block.header.clone();
+	if let Some(parent_hash) = parent_hash {
+		header.parent_hash = parent_hash;
+	}
+	header.timestamp /= 1000;
+	H256::from(keccak_256(&rlp::encode(&header)))
+}
+
 pub fn sync_genesis_block<Block: BlockT, C>(
 	client: &C,
 	backend: &fc_db::kv::Backend<Block, C>,
@@ -127,13 +155,12 @@ where
 				.map_err(|e| format!("{:?}", e))?;
 			legacy_block.map(|block| block.into())
 		};
-		let block_hash = block
-			.ok_or_else(|| "Ethereum genesis block not found".to_string())?
-			.header
-			.hash();
+		let block = block.ok_or_else(|| "Ethereum genesis block not found".to_string())?;
+		let block_hash = block.header.hash();
 		let mapping_commitment = fc_db::kv::MappingCommitment::<Block> {
 			block_hash: substrate_block_hash,
 			ethereum_block_hash: block_hash,
+			rpc_compatible_block_hash: Some(rpc_compatible_block_hash(&block, None)),
 			ethereum_transaction_hashes: Vec::new(),
 		};
 		backend.mapping().write_hashes(mapping_commitment)?;
@@ -209,6 +236,22 @@ where
 		{
 			return Ok(false);
 		}
+		let parent_has_rpc_compatible_hash = frontier_backend
+			.mapping()
+			.rpc_compatible_hash_by_substrate_hash(operating_header.parent_hash())?
+			.is_some();
+		if !frontier_backend
+			.mapping()
+			.is_synced(operating_header.parent_hash())?
+			|| !parent_has_rpc_compatible_hash
+		{
+			current_syncing_tips.push(operating_header.hash());
+			current_syncing_tips.push(*operating_header.parent_hash());
+			frontier_backend
+				.meta()
+				.write_current_syncing_tips(current_syncing_tips)?;
+			return Ok(true);
+		}
 		sync_block(storage_override, frontier_backend, &operating_header)?;
 
 		current_syncing_tips.push(*operating_header.parent_hash());
@@ -281,12 +324,17 @@ where
 	C: HeaderBackend<Block>,
 	BE: HeaderBackend<Block>,
 {
-	if frontier_backend.mapping().is_synced(&checking_tip)? {
+	let is_synced = frontier_backend.mapping().is_synced(&checking_tip)?;
+	let has_rpc_compatible_hash = frontier_backend
+		.mapping()
+		.rpc_compatible_hash_by_substrate_hash(&checking_tip)?
+		.is_some();
+	if is_synced && has_rpc_compatible_hash {
 		return Ok(None);
 	}
 
 	match substrate_backend.header(checking_tip) {
-		Ok(Some(checking_header)) if checking_header.number() >= &sync_from => {
+		Ok(Some(checking_header)) if is_synced || checking_header.number() >= &sync_from => {
 			Ok(Some(checking_header))
 		}
 		Ok(Some(_)) => Ok(None),
