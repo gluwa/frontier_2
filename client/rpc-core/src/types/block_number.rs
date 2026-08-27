@@ -179,11 +179,11 @@ impl<'a> Visitor<'a> for BlockNumberOrHashVisitor {
 							hash,
 							require_canonical: false,
 						})
-						.map_err(|e| Error::custom(format!("Invalid block hash: {}", e)));
+						.map_err(|e| Error::custom(format!("Invalid block hash: {e}")));
 				}
 				u64::from_str_radix(hex, 16)
 					.map(BlockNumberOrHash::Num)
-					.map_err(|e| Error::custom(format!("Invalid block number: {}", e)))
+					.map_err(|e| Error::custom(format!("Invalid block number: {e}")))
 			}
 			_ => value
 				.parse::<u64>()
@@ -261,11 +261,11 @@ mod tests {
 			} => {
 				assert!(!require_canonical);
 				assert_eq!(
-					format!("{:#x}", hash),
+					format!("{hash:#x}"),
 					"0x608aef548e02aa13187172e750fd31bd05c39f6f253035a89d6c4882228f03ef"
 				);
 			}
-			other => panic!("expected Hash variant, got {:?}", other),
+			other => panic!("expected Hash variant, got {other:?}"),
 		}
 	}
 }
