@@ -98,6 +98,13 @@ pub enum TransactionValidationError {
 	/// This explicit limit is more predictable than implicit limits based on transaction size,
 	/// providing developers with clear boundaries and better DoS protection.
 	AuthorizationListTooLarge,
+	/// EIP-7702 transaction is a contract creation (empty `to`), which the spec forbids.
+	///
+	/// According to EIP-7702, a SetCode (type-4) transaction's `destination` must be an address
+	/// (a `Call`); it can never be a contract creation. A conformant client rejects such a
+	/// transaction during validation, so accepting it here is a spec deviation that can also make
+	/// block-validity differ across implementations.
+	InvalidAuthorizationCreate,
 	/// Unknown error
 	#[num_enum(default)]
 	UnknownError,
@@ -284,6 +291,13 @@ impl<'config, E: From<TransactionValidationError>> CheckEvmTransaction<'config, 
 	///
 	pub fn with_eip7702_authorization_list(&self, is_eip7702: bool) -> Result<&Self, E> {
 		if is_eip7702 {
+			// EIP-7702 validation: a SetCode transaction MUST target an address.
+			// `to == null` (a contract-creation shape) is not a valid type-4 transaction and must
+			// be rejected here (matches geth/reth/anvil, which refuse it at tx validation).
+			if self.transaction.to.is_none() {
+				return Err(TransactionValidationError::InvalidAuthorizationCreate.into());
+			}
+
 			// EIP-7702 validation: Check if authorization list is empty
 			// According to EIP-7702 specification: "The transaction is also considered invalid when the length of authorization_list is zero."
 			if self.transaction.authorization_list.is_empty() {
@@ -319,6 +333,7 @@ mod tests {
 		InvalidSignature,
 		EmptyAuthorizationList,
 		AuthorizationListTooLarge,
+		InvalidAuthorizationCreate,
 		UnknownError,
 	}
 
@@ -340,6 +355,9 @@ mod tests {
 				}
 				TransactionValidationError::AuthorizationListTooLarge => {
 					TestError::AuthorizationListTooLarge
+				}
+				TransactionValidationError::InvalidAuthorizationCreate => {
+					TestError::InvalidAuthorizationCreate
 				}
 				TransactionValidationError::UnknownError => TestError::UnknownError,
 			}
@@ -460,6 +478,48 @@ mod tests {
 			blockchain_gas_limit: U256::from(1u8),
 			..Default::default()
 		})
+	}
+
+	// EIP-7702: a type-4 tx with an empty `to` (contract creation) must be rejected.
+	fn transaction_eip7702_create<'config>() -> CheckEvmTransaction<'config, TestError> {
+		let mut tx = test_env(TestCase::default());
+		tx.transaction.to = None; // CREATE shape
+		tx.transaction.authorization_list = vec![(
+			U256::from(42u64),
+			H160::default(),
+			U256::zero(),
+			Some(H160::default()),
+		)];
+		tx
+	}
+
+	// EIP-7702: a type-4 tx WITH a `to` (call) is not rejected by this guard.
+	fn transaction_eip7702_call<'config>() -> CheckEvmTransaction<'config, TestError> {
+		let mut tx = test_env(TestCase::default());
+		tx.transaction.to = Some(H160::default()); // Call shape
+		tx.transaction.authorization_list = vec![(
+			U256::from(42u64),
+			H160::default(),
+			U256::zero(),
+			Some(H160::default()),
+		)];
+		tx
+	}
+
+	#[test]
+	fn eip7702_create_shape_is_rejected() {
+		// empty `to` + is_eip7702 => InvalidAuthorizationCreate
+		let tx = transaction_eip7702_create();
+		assert_eq!(
+			tx.with_eip7702_authorization_list(true).err(),
+			Some(TestError::InvalidAuthorizationCreate)
+		);
+		// a valid `to` (Call) passes the create guard (and the non-empty list check)
+		let tx = transaction_eip7702_call();
+		assert!(tx.with_eip7702_authorization_list(true).is_ok());
+		// when not an EIP-7702 tx, the guard is inert even with empty `to`
+		let tx = transaction_eip7702_create();
+		assert!(tx.with_eip7702_authorization_list(false).is_ok());
 	}
 
 	fn transaction_nonce_high<'config>() -> CheckEvmTransaction<'config, TestError> {

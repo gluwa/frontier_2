@@ -50,6 +50,9 @@ impl Geth {
 					VError::InvalidFeeInput => "invalid fee input".into(),
 					VError::EmptyAuthorizationList => "authorization list cannot be empty".into(),
 					VError::AuthorizationListTooLarge => "authorization list too large".into(),
+					VError::InvalidAuthorizationCreate => {
+						"setcode transaction cannot be a contract creation".into()
+					}
 					_ => "transaction validation error".into(),
 				},
 				_ => "unknown error".into(),

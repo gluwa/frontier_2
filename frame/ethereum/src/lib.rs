@@ -912,6 +912,21 @@ impl<T: Config> Pallet<T> {
 				Ok((Some(target), None, CallOrCreateInfo::Call(res)))
 			}
 			ethereum::TransactionAction::Create => {
+				// EIP-7702: a SetCode (type-4) transaction can never be a contract creation.
+				// This should already be rejected during validation; guard here as a last line of
+				// defense so a delegation can never be applied on the CREATE path (which would also
+				// double-increment the sender nonce for a self-sponsored authorization).
+				if matches!(transaction, Transaction::EIP7702(_)) {
+					return Err(DispatchErrorWithPostInfo {
+						post_info: PostDispatchInfo {
+							actual_weight: Some(Weight::zero()),
+							pays_fee: Pays::Yes,
+						},
+						error: sp_runtime::DispatchError::Other(
+							"EIP-7702 SetCode transaction cannot be a contract creation",
+						),
+					});
+				}
 				let res = if let Some(force_address) = maybe_force_create_address {
 					match T::Runner::create_force_address(
 						from,
@@ -1156,6 +1171,11 @@ impl From<TransactionValidationError> for InvalidTransactionWrapper {
 			TransactionValidationError::AuthorizationListTooLarge => {
 				InvalidTransactionWrapper(InvalidTransaction::Custom(
 					TransactionValidationError::AuthorizationListTooLarge as u8,
+				))
+			}
+			TransactionValidationError::InvalidAuthorizationCreate => {
+				InvalidTransactionWrapper(InvalidTransaction::Custom(
+					TransactionValidationError::InvalidAuthorizationCreate as u8,
 				))
 			}
 			TransactionValidationError::UnknownError => InvalidTransactionWrapper(
