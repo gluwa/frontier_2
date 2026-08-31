@@ -91,6 +91,26 @@ where
 		let info = self.client.info();
 		let best_hash = info.best_hash;
 		let best_number = UniqueSaturatedInto::<u64>::unique_saturated_into(info.best_number);
+		// Reject Log filters whose block range exceeds `max_block_range`, mirroring the
+		// `eth_getLogs` cap so it cannot be bypassed via the filter API (upstream #1824).
+		if let FilterType::Log(ref filter) = filter_type {
+			let from_number = filter
+				.from_block
+				.and_then(|v| v.to_min_block_num())
+				.map(UniqueSaturatedInto::<u64>::unique_saturated_into)
+				.unwrap_or(best_number);
+			let to_number = filter
+				.to_block
+				.and_then(|v| v.to_min_block_num())
+				.map(UniqueSaturatedInto::<u64>::unique_saturated_into)
+				.unwrap_or(best_number);
+			if to_number.saturating_sub(from_number) > self.max_block_range.into() {
+				return Err(internal_err(format!(
+					"block range is too wide (maximum {})",
+					self.max_block_range
+				)));
+			}
+		}
 		let pool = self.filter_pool.clone();
 		let response = if let Ok(locked) = &mut pool.lock() {
 			if locked.len() >= self.max_stored_filters {
@@ -413,6 +433,13 @@ where
 			.and_then(|v| v.to_min_block_num())
 			.map(|s| s.unique_saturated_into())
 			.unwrap_or(best_number);
+
+		if current_number.saturating_sub(from_number) > self.max_block_range.into() {
+			return Err(internal_err(format!(
+				"block range is too wide (maximum {})",
+				self.max_block_range
+			)));
+		}
 
 		let logs = if backend.is_indexed() {
 			filter_range_logs_indexed(
