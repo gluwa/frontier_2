@@ -42,6 +42,62 @@ use fp_rpc::{EthereumRuntimeRPCApi, TransactionStatus};
 
 use crate::{cache::EthBlockDataCacheTask, frontier_backend_client, internal_err};
 
+/// Maximum number of addresses a log filter may match on.
+const MAX_FILTER_ADDRESSES: usize = 1024;
+/// Maximum number of alternatives a single log filter topic position may hold.
+const MAX_FILTER_TOPIC_OPTIONS: usize = 1024;
+
+fn variadic_len<T: sp_runtime::DeserializeOwned>(value: &VariadicValue<T>) -> usize {
+	match value {
+		VariadicValue::Single(_) => 1,
+		VariadicValue::Multiple(items) => items.len(),
+		_ => 0,
+	}
+}
+
+/// Rejects log filters whose address or topic lists exceed the configured limits.
+fn validate_filter_size(filter: &Filter) -> RpcResult<()> {
+	if filter.address.as_ref().map_or(0, variadic_len) > MAX_FILTER_ADDRESSES {
+		return Err(internal_err(format!(
+			"too many filter addresses (maximum {MAX_FILTER_ADDRESSES})"
+		)));
+	}
+	if filter
+		.topics()
+		.iter()
+		.any(|topic| variadic_len(topic) > MAX_FILTER_TOPIC_OPTIONS)
+	{
+		return Err(internal_err(format!(
+			"too many filter topic options (maximum {MAX_FILTER_TOPIC_OPTIONS})"
+		)));
+	}
+	Ok(())
+}
+
+/// Rejects block-hash log queries whose result exceeds `max_past_logs`, matching range queries.
+fn ensure_within_max_past_logs(logs: &[Log], max_past_logs: u32) -> RpcResult<()> {
+	if logs.len() > max_past_logs as usize {
+		return Err(internal_err(format!(
+			"query returned more than {max_past_logs} results"
+		)));
+	}
+	Ok(())
+}
+
+/// Moves a filter's poll cursor forward to `next`, once its changes were retrieved.
+///
+/// The cursor never moves backwards, so concurrent polls of the same filter cannot rewind it.
+fn advance_filter_cursor(filter_pool: &FilterPool, key: U256, next: u64) {
+	if let Ok(mut locked) = filter_pool.lock() {
+		if let Some(item) = locked.get_mut(&key) {
+			let current = item.last_poll.to_min_block_num().unwrap_or_default();
+			if next > current {
+				item.last_poll = BlockNumberOrHash::Num(next);
+			}
+		}
+	}
+}
+
 pub struct EthFilter<B: BlockT, C, BE, P> {
 	client: Arc<C>,
 	backend: Arc<dyn fc_api::Backend<B>>,
@@ -94,6 +150,7 @@ where
 		// Reject Log filters whose block range exceeds `max_block_range`, mirroring the
 		// `eth_getLogs` cap so it cannot be bypassed via the filter API (upstream #1824).
 		if let FilterType::Log(ref filter) = filter_type {
+			validate_filter_size(filter)?;
 			let from_number = filter
 				.from_block
 				.and_then(|v| v.to_min_block_num())
@@ -119,15 +176,6 @@ where
 					self.max_stored_filters
 				)));
 			}
-			let next_back = {
-				let mut iter = locked.iter();
-				iter.next_back()
-			};
-			let last_key = match next_back {
-				Some((k, _)) => *k,
-				None => U256::zero(),
-			};
-
 			let pending_transaction_hashes = if let FilterType::PendingTransaction = filter_type {
 				let txs_ready = self
 					.pool
@@ -147,8 +195,14 @@ where
 				HashSet::new()
 			};
 
-			// Assume `max_stored_filters` is always < U256::max.
-			let key = last_key.checked_add(U256::one()).unwrap();
+			// Random, non-zero identifiers that fit the `Index` (usize) used by the filter
+			// methods, so an identifier reveals nothing about other filters.
+			let key = loop {
+				let candidate = U256::from(rand::random::<u64>() as usize);
+				if !candidate.is_zero() && !locked.contains_key(&candidate) {
+					break candidate;
+				}
+			};
 			locked.insert(
 				key,
 				FilterPoolItem {
@@ -209,6 +263,7 @@ where
 				filter: Filter,
 				from_number: NumberFor<B>,
 				current_number: NumberFor<B>,
+				next: u64,
 			},
 			Error(jsonrpsee::types::ErrorObjectOwned),
 		}
@@ -224,19 +279,15 @@ where
 			if let Some(pool_item) = locked.get(&key).cloned() {
 				match &pool_item.filter_type {
 					// For each block created since last poll, get a vector of ethereum hashes.
+					// At most `max_block_range` blocks are returned per poll; the cursor is only
+					// advanced once they were retrieved, so a lagging client catches up over
+					// several polls without skipping any block.
 					FilterType::Block => {
-						let last = pool_item.last_poll.to_min_block_num().unwrap();
-						let next = best_number + 1;
-						// Update filter `last_poll`.
-						locked.insert(
-							key,
-							FilterPoolItem {
-								last_poll: BlockNumberOrHash::Num(next),
-								filter_type: pool_item.filter_type.clone(),
-								at_block: pool_item.at_block,
-								pending_transaction_hashes: HashSet::new(),
-							},
-						);
+						let last = pool_item.last_poll.to_min_block_num().unwrap_or_default();
+						let range_end = last
+							.saturating_add(u64::from(self.max_block_range))
+							.saturating_add(1);
+						let next = std::cmp::min(best_number.saturating_add(1), range_end);
 
 						FuturePath::<B>::Block { last, next }
 					}
@@ -277,18 +328,8 @@ where
 						}
 					}
 					// For each event since last poll, get a vector of ethereum logs.
+					// Same bounding and cursor rules as block filters.
 					FilterType::Log(filter) => {
-						// Update filter `last_poll`.
-						locked.insert(
-							key,
-							FilterPoolItem {
-								last_poll: BlockNumberOrHash::Num(best_number + 1),
-								filter_type: pool_item.filter_type.clone(),
-								at_block: pool_item.at_block,
-								pending_transaction_hashes: HashSet::new(),
-							},
-						);
-
 						// Either the filter-specific `to` block or best block.
 						let best_number = self.client.info().best_number;
 						let mut current_number = filter
@@ -302,10 +343,10 @@ where
 						}
 
 						// The from clause is the max(last_poll, filter_from).
-						let last_poll = pool_item
+						let last_poll: NumberFor<B> = pool_item
 							.last_poll
 							.to_min_block_num()
-							.unwrap()
+							.unwrap_or_default()
 							.unique_saturated_into();
 
 						let filter_from = filter
@@ -315,12 +356,21 @@ where
 							.unwrap_or(last_poll);
 
 						let from_number = std::cmp::max(last_poll, filter_from);
+						let range_end =
+							from_number.saturating_add(NumberFor::<B>::from(self.max_block_range));
+						if current_number > range_end {
+							current_number = range_end;
+						}
+						let next =
+							UniqueSaturatedInto::<u64>::unique_saturated_into(current_number)
+								.saturating_add(1);
 
 						// Build the response.
 						FuturePath::Log {
 							filter: filter.clone(),
 							from_number,
 							current_number,
+							next,
 						}
 					}
 				}
@@ -351,6 +401,7 @@ where
 						ethereum_hashes.push(block.header.hash())
 					}
 				}
+				advance_filter_cursor(&pool, key, next);
 				Ok(FilterChanges::Hashes(ethereum_hashes))
 			}
 			FuturePath::PendingTransaction { new_hashes } => Ok(FilterChanges::Hashes(new_hashes)),
@@ -358,6 +409,7 @@ where
 				filter,
 				from_number,
 				current_number,
+				next,
 			} => {
 				let logs = if backend.is_indexed() {
 					filter_range_logs_indexed(
@@ -382,6 +434,7 @@ where
 					.await?
 				};
 
+				advance_filter_cursor(&pool, key, next);
 				Ok(FilterChanges::Logs(logs))
 			}
 		}
@@ -483,6 +536,7 @@ where
 	}
 
 	async fn logs(&self, filter: Filter) -> RpcResult<Vec<Log>> {
+		validate_filter_size(&filter)?;
 		let client = Arc::clone(&self.client);
 		let block_data_cache = Arc::clone(&self.block_data_cache);
 		let backend = Arc::clone(&self.backend);
@@ -508,6 +562,7 @@ where
 				.await;
 			if let (Some(block), Some(statuses)) = (block, statuses) {
 				logs = filter_block_logs(&filter, block, statuses);
+				ensure_within_max_past_logs(&logs, max_past_logs)?;
 			}
 		} else {
 			let best_number = client.info().best_number;
@@ -809,4 +864,103 @@ pub(crate) fn filter_block_logs(
 		}
 	}
 	logs
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use ethereum_types::H160;
+	use std::sync::Mutex;
+
+	fn pool_with(key: U256, last_poll: u64) -> FilterPool {
+		let pool: FilterPool = Arc::new(Mutex::new(BTreeMap::new()));
+		pool.lock().unwrap().insert(
+			key,
+			FilterPoolItem {
+				last_poll: BlockNumberOrHash::Num(last_poll),
+				filter_type: FilterType::Block,
+				at_block: last_poll,
+				pending_transaction_hashes: HashSet::new(),
+			},
+		);
+		pool
+	}
+
+	fn last_poll(pool: &FilterPool, key: U256) -> u64 {
+		pool.lock().unwrap()[&key]
+			.last_poll
+			.to_min_block_num()
+			.unwrap()
+	}
+
+	#[test]
+	fn filter_cursor_only_moves_forward() {
+		let key = U256::from(7);
+		let pool = pool_with(key, 10);
+
+		advance_filter_cursor(&pool, key, 20);
+		assert_eq!(last_poll(&pool, key), 20);
+
+		advance_filter_cursor(&pool, key, 15);
+		assert_eq!(last_poll(&pool, key), 20);
+	}
+
+	#[test]
+	fn filter_cursor_ignores_removed_filters() {
+		let pool = pool_with(U256::from(7), 10);
+		advance_filter_cursor(&pool, U256::from(8), 20);
+		assert_eq!(pool.lock().unwrap().len(), 1);
+		assert_eq!(last_poll(&pool, U256::from(7)), 10);
+	}
+
+	#[test]
+	fn filter_size_limits() {
+		let addresses = |n: u64| {
+			Some(VariadicValue::Multiple(
+				(0..n).map(H160::from_low_u64_be).collect(),
+			))
+		};
+
+		let filter = Filter {
+			address: addresses(MAX_FILTER_ADDRESSES as u64),
+			..Default::default()
+		};
+		assert!(validate_filter_size(&filter).is_ok());
+
+		let filter = Filter {
+			address: addresses(MAX_FILTER_ADDRESSES as u64 + 1),
+			..Default::default()
+		};
+		assert!(validate_filter_size(&filter).is_err());
+
+		let options = |n: u64| VariadicValue::Multiple((0..n).map(H256::from_low_u64_be).collect());
+		let filter = Filter {
+			topics: Some(
+				vec![options(1), options(MAX_FILTER_TOPIC_OPTIONS as u64 + 1)]
+					.try_into()
+					.unwrap(),
+			),
+			..Default::default()
+		};
+		assert!(validate_filter_size(&filter).is_err());
+	}
+
+	#[test]
+	fn max_past_logs_applies_to_single_block_results() {
+		let log = Log {
+			address: H160::zero(),
+			topics: vec![],
+			data: Bytes(vec![]),
+			block_hash: None,
+			block_number: None,
+			transaction_hash: None,
+			transaction_index: None,
+			log_index: None,
+			transaction_log_index: None,
+			removed: false,
+		};
+		let logs = vec![log; 3];
+		assert!(ensure_within_max_past_logs(&logs, 3).is_ok());
+		assert!(ensure_within_max_past_logs(&logs, 2).is_err());
+	}
 }
