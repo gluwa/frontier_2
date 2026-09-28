@@ -557,18 +557,31 @@ where
 		// Adapt request for gas estimation.
 		let request = EC::EstimateGasAdapter::adapt_request(request);
 
-		// For simple transfer to simple account, return MIN_GAS_PER_TX directly
+		// For a simple transfer (no calldata, no EIP-2930 access list, and no EIP-7702
+		// authorization list, all of which carry their own intrinsic gas cost) to a plain
+		// account, return MIN_GAS_PER_TX directly.
 		let is_simple_transfer = match &request.data() {
 			None => true,
 			Some(vec) => vec.0.is_empty(),
-		};
+		} && request
+			.access_list
+			.as_ref()
+			.map_or(true, |list| list.is_empty())
+			&& request
+				.authorization_list
+				.as_ref()
+				.map_or(true, |list| list.is_empty());
 		if is_simple_transfer {
 			if let Some(to) = request.to {
-				let to_code = api
-					.account_code_at(substrate_hash, to)
-					.map_err(|err| internal_err(format!("runtime error: {err}")))?;
-				if to_code.is_empty() {
-					return Ok(MIN_GAS_PER_TX);
+				// Registered precompiles execute and charge gas despite having no ordinary
+				// account code, so they must never be eligible for the flat-fee shortcut.
+				if !EC::is_precompile(to) {
+					let to_code = api
+						.account_code_at(substrate_hash, to)
+						.map_err(|err| internal_err(format!("runtime error: {err}")))?;
+					if to_code.is_empty() {
+						return Ok(MIN_GAS_PER_TX);
+					}
 				}
 			}
 		}

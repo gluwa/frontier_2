@@ -62,6 +62,15 @@ pub use self::{execute::EstimateGasAdapter, filter::EthFilter};
 pub trait EthConfig<B: BlockT, C>: Send + Sync + 'static {
 	type EstimateGasAdapter: EstimateGasAdapter + Send + Sync;
 	type RuntimeStorageOverride: RuntimeStorageOverride<B, C>;
+
+	/// Returns `true` if `address` is a registered precompile on this chain.
+	///
+	/// `estimate_gas` uses this to keep its flat minimum-gas shortcut for simple transfers
+	/// from being applied to precompiles, which execute and charge gas despite having no
+	/// on-chain account code.
+	fn is_precompile(_address: H160) -> bool {
+		false
+	}
 }
 
 impl<B: BlockT, C> EthConfig<B, C> for () {

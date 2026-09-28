@@ -264,3 +264,35 @@ describeWithFrontier("Frontier RPC (RPC execution)", (context) => {
 		expect(result.error.data).to.match(/^Ambiguous value for `data` and `input`/);
 	});
 });
+
+describeWithFrontier("Frontier RPC (estimate gas shortcut)", (context) => {
+	const NO_CODE_ADDRESS = "0x1230000000000000000000000000000000000a";
+
+	step("uses the flat minimum-gas shortcut for a plain simple transfer", async function () {
+		const estimate = await customRequest(context.web3, "eth_estimateGas", [
+			{
+				from: GENESIS_ACCOUNT,
+				to: NO_CODE_ADDRESS,
+				value: "0x1",
+			},
+		]);
+		expect(context.web3.utils.hexToNumber(estimate.result)).to.equal(21000);
+	});
+
+	step("does not use the flat minimum-gas shortcut when an access list is provided", async function () {
+		const estimate = await customRequest(context.web3, "eth_estimateGas", [
+			{
+				from: GENESIS_ACCOUNT,
+				to: NO_CODE_ADDRESS,
+				value: "0x1",
+				accessList: [
+					{
+						address: "0x1230000000000000000000000000000000000b",
+						storageKeys: ["0x" + "00".repeat(31) + "01"],
+					},
+				],
+			},
+		]);
+		expect(context.web3.utils.hexToNumber(estimate.result)).to.be.above(21000);
+	});
+});
