@@ -298,7 +298,7 @@ where
 			.map_err(|e| RunnerError { error: e, weight })?;
 
 		let vicinity = Vicinity {
-			gas_price: base_fee,
+			gas_price: total_fee_per_gas,
 			origin: source,
 		};
 

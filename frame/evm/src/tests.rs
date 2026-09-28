@@ -1839,3 +1839,126 @@ mod eip7939_clz_test {
 		run_clz_test(CLZ_MSB_UNSET, 1);
 	}
 }
+
+/// GASPRICE should return the EIP-1559 effective gas price charged to the
+/// sender (base fee + priority fee), while BASEFEE keeps returning the block
+/// base fee unchanged.
+mod gasprice_test {
+	use super::*;
+	use evm::ExitSucceed;
+	use fp_evm::CreateInfo;
+
+	// Runtime code (13 bytes): GASPRICE, PUSH1 0, MSTORE, BASEFEE, PUSH1 32,
+	// MSTORE, PUSH1 64, PUSH1 0, RETURN.
+	// Deployed via the PUSH13+MSTORE self-return trick used by the CLZ tests
+	// above: the init code pushes the runtime code left-padded to 32 bytes,
+	// stores it in memory, then returns just the 13 non-zero trailing bytes.
+	const GASPRICE_BASEFEE_CONTRACT: &str = "6c3a6000524860205260406000f3600052600d6013f3";
+
+	fn create_test_contract(
+		max_fee_per_gas: U256,
+		gas_limit: u64,
+	) -> Result<CreateInfo, crate::RunnerError<crate::Error<Test>>> {
+		<Test as Config>::Runner::create(
+			H160::default(),
+			hex::decode(GASPRICE_BASEFEE_CONTRACT).expect("Failed to decode contract"),
+			U256::zero(),
+			gas_limit,
+			Some(max_fee_per_gas),
+			None,
+			None,
+			Vec::new(),
+			Vec::new(),
+			true, // transactional
+			true, // must be validated
+			None,
+			Some(0),
+			<Test as Config>::config(),
+		)
+	}
+
+	fn call_contract(
+		contract_addr: H160,
+		max_fee_per_gas: U256,
+		max_priority_fee_per_gas: Option<U256>,
+		gas_limit: u64,
+	) -> Result<CallInfo, crate::RunnerError<crate::Error<Test>>> {
+		<Test as Config>::Runner::call(
+			H160::default(),
+			contract_addr,
+			Vec::new(),
+			U256::zero(),
+			gas_limit,
+			Some(max_fee_per_gas),
+			max_priority_fee_per_gas,
+			None,
+			Vec::new(),
+			Vec::new(),
+			true, // transactional
+			true, // must be validated
+			None,
+			Some(0),
+			<Test as Config>::config(),
+		)
+	}
+
+	fn deploy(max_fee_per_gas: U256, gas_limit: u64) -> H160 {
+		let result = create_test_contract(max_fee_per_gas, gas_limit)
+			.expect("contract deployment should succeed");
+		assert_eq!(
+			result.exit_reason,
+			crate::ExitReason::Succeed(ExitSucceed::Returned)
+		);
+		result.value
+	}
+
+	#[test]
+	fn gasprice_returns_effective_price_with_nonzero_tip() {
+		new_test_ext().execute_with(|| {
+			let gas_limit: u64 = 1_000_000;
+			let (base_fee, _) = <Test as Config>::FeeCalculator::min_gas_price();
+			let max_fee_per_gas = U256::from(2_000_000_000u128);
+			let tip = U256::from(500_000_000u128);
+
+			let contract_addr = deploy(max_fee_per_gas, gas_limit);
+			let call_result = call_contract(contract_addr, max_fee_per_gas, Some(tip), gas_limit)
+				.expect("contract call should succeed");
+			assert_eq!(
+				call_result.exit_reason,
+				crate::ExitReason::Succeed(ExitSucceed::Returned)
+			);
+
+			// (max_fee_per_gas - base_fee).min(tip)
+			let effective_gas_price = base_fee + (max_fee_per_gas - base_fee).min(tip);
+			assert_ne!(
+				effective_gas_price, base_fee,
+				"test is only meaningful with a nonzero realized priority fee"
+			);
+
+			let expected = [effective_gas_price.to_big_endian(), base_fee.to_big_endian()].concat();
+
+			assert_eq!(call_result.value, expected);
+		});
+	}
+
+	#[test]
+	fn gasprice_equals_basefee_with_no_tip() {
+		new_test_ext().execute_with(|| {
+			let gas_limit: u64 = 1_000_000;
+			let (base_fee, _) = <Test as Config>::FeeCalculator::min_gas_price();
+			let max_fee_per_gas = U256::from(2_000_000_000u128);
+
+			let contract_addr = deploy(max_fee_per_gas, gas_limit);
+			let call_result = call_contract(contract_addr, max_fee_per_gas, None, gas_limit)
+				.expect("contract call should succeed");
+			assert_eq!(
+				call_result.exit_reason,
+				crate::ExitReason::Succeed(ExitSucceed::Returned)
+			);
+
+			let expected = [base_fee.to_big_endian(), base_fee.to_big_endian()].concat();
+
+			assert_eq!(call_result.value, expected);
+		});
+	}
+}
