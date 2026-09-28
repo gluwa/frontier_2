@@ -226,6 +226,43 @@ describeWithFrontier("Frontier RPC (StateOverride)", (context) => {
 		expect(Web3.utils.hexToNumberString(result2)).to.equal("0");
 	});
 
+	it("should apply state overrides to a contract-creation eth_call", async function () {
+		// `otherAddress` is not funded in genesis, so a creation call transferring `value`
+		// from it fails unless a state override grants it a balance.
+		const deployData = contract
+			.deploy({
+				data: STATE_OVERRIDE_TEST_CONTRACT_BYTECODE,
+				arguments: [100],
+			})
+			.encodeABI();
+		const value = Web3.utils.numberToHex(Web3.utils.toWei("1", "ether"));
+
+		const { error: errorWithoutOverride } = await customRequest(context.web3, "eth_call", [
+			{
+				from: otherAddress,
+				data: deployData,
+				value,
+			},
+		]);
+		expect(errorWithoutOverride, "creation should fail without a balance override").to.exist;
+
+		const { result, error } = await customRequest(context.web3, "eth_call", [
+			{
+				from: otherAddress,
+				data: deployData,
+				value,
+			},
+			"latest",
+			{
+				[otherAddress]: {
+					balance: Web3.utils.numberToHex(Web3.utils.toWei("1000", "ether")),
+				},
+			},
+		]);
+		expect(error, "creation should succeed once the sender balance is overridden").to.not.exist;
+		expect(result).to.equal(StateOverrideTest.deployedBytecode);
+	});
+
 	it("should set MultiplyBy7 deployedBytecode with state override", async function () {
 		const testContract = new context.web3.eth.Contract(Test.abi as AbiItem[]);
 		const { result } = await customRequest(context.web3, "eth_call", [
