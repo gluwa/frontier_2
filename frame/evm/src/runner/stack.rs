@@ -971,6 +971,9 @@ pub struct Recorded {
 	account_storages: BTreeMap<(H160, H256), bool>,
 }
 
+/// Transient storage writes of one call frame: each slot with the value it held before the write.
+type TransientJournal = Vec<((H160, H256), Option<H256>)>;
+
 /// Substrate backend for EVM.
 pub struct SubstrateStackState<'vicinity, 'config, T> {
 	vicinity: &'vicinity Vicinity,
@@ -979,7 +982,7 @@ pub struct SubstrateStackState<'vicinity, 'config, T> {
 	transient_storage: BTreeMap<(H160, H256), H256>,
 	/// One journal per open call frame, recording the value each transient slot held before the
 	/// frame first wrote it, so a reverted frame's writes can be undone (EIP-1153).
-	transient_journal: Vec<Vec<((H160, H256), Option<H256>)>>,
+	transient_journal: Vec<TransientJournal>,
 	recorded: Recorded,
 	weight_info: Option<WeightInfo>,
 	storage_meter: Option<StorageMeter>,
