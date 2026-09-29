@@ -439,11 +439,14 @@ where
 								.collect::<Vec<(sp_core::H160, Vec<H256>)>>(),
 						),
 					));
-					let overlayed_changes = self.create_overrides_overlay(
+					// Bound to a variable (rather than inlined into `params`) so the same
+					// overlay can be reused below to read back the code the creation just
+					// wrote; a fresh overlay there would never see the deployment.
+					let overlayed_changes = RefCell::new(self.create_overrides_overlay(
 						substrate_hash,
 						api_version,
 						state_overrides,
-					)?;
+					)?);
 
 					// Enable proof size recording
 					let recorder: sp_trie::recorder::Recorder<HashingFor<B>> = Default::default();
@@ -455,18 +458,18 @@ where
 						at: substrate_hash,
 						function: "EthereumRuntimeRPCApi_create",
 						arguments: encoded_params,
-						overlayed_changes: &RefCell::new(overlayed_changes),
+						overlayed_changes: &overlayed_changes,
 						call_context: CallContext::Offchain,
 						recorder: &Some(recorder),
 						extensions: &RefCell::new(exts),
 					};
 
 					let address = if api_version == 4 {
-						let info = self
-							.client
-							.call_api_at(params)
-							.and_then(|r| {
-								Result::map_err(
+						let info =
+							self.client
+								.call_api_at(params)
+								.and_then(|r| {
+									Result::map_err(
 									<Result<ExecutionInfo::<H160>, DispatchError> as Decode>::decode(&mut &r[..]),
 									|error| sp_api::ApiError::FailedToDecodeReturnValue {
 										function: "EthereumRuntimeRPCApi_create",
@@ -474,9 +477,9 @@ where
 										raw: r
 									},
 								)
-							})
-							.map_err(|err| internal_err(format!("runtime error: {err}")))?
-							.map_err(|err| internal_err(format!("execution fatal: {err:?}")))?;
+								})
+								.map_err(|err| internal_err(format!("runtime error: {err}")))?
+								.map_err(|err| internal_err(format!("execution fatal: {err:?}")))?;
 
 						error_on_execution_failure(&info.exit_reason, &[])?;
 						info.value
@@ -501,9 +504,39 @@ where
 						info.value
 					};
 
-					let code = api
-						.account_code_at(substrate_hash, address)
+					// Read the deployed code back through the same overlay the creation
+					// call just wrote to, not through `api` (which is a separate, unrelated
+					// execution context and would never see the new contract's code).
+					let code_recorder: sp_trie::recorder::Recorder<HashingFor<B>> =
+						Default::default();
+					let code_ext =
+						sp_trie::proof_size_extension::ProofSizeExt::new(code_recorder.clone());
+					let mut code_exts = Extensions::new();
+					code_exts.register(code_ext);
+
+					let code_params = CallApiAtParams {
+						at: substrate_hash,
+						function: "EthereumRuntimeRPCApi_account_code_at",
+						arguments: Encode::encode(&address),
+						overlayed_changes: &overlayed_changes,
+						call_context: CallContext::Offchain,
+						recorder: &Some(code_recorder),
+						extensions: &RefCell::new(code_exts),
+					};
+					let code = self
+						.client
+						.call_api_at(code_params)
+						.and_then(|r| {
+							Result::map_err(<Vec<u8> as Decode>::decode(&mut &r[..]), |error| {
+								sp_api::ApiError::FailedToDecodeReturnValue {
+									function: "EthereumRuntimeRPCApi_account_code_at",
+									error,
+									raw: r,
+								}
+							})
+						})
 						.map_err(|err| internal_err(format!("runtime error: {err}")))?;
+
 					Ok(Bytes(code))
 				} else if api_version == 6 {
 					// Pectra EIP-7702 support
@@ -525,11 +558,14 @@ where
 						&Some(access_list),
 						&authorization_list,
 					));
-					let overlayed_changes = self.create_overrides_overlay(
+					// Bound to a variable (rather than inlined into `params`) so the same
+					// overlay can be reused below to read back the code the creation just
+					// wrote; a fresh overlay there would never see the deployment.
+					let overlayed_changes = RefCell::new(self.create_overrides_overlay(
 						substrate_hash,
 						api_version,
 						state_overrides,
-					)?;
+					)?);
 
 					// Enable proof size recording
 					let recorder: sp_trie::recorder::Recorder<HashingFor<B>> = Default::default();
@@ -541,7 +577,7 @@ where
 						at: substrate_hash,
 						function: "EthereumRuntimeRPCApi_create",
 						arguments: encoded_params,
-						overlayed_changes: &RefCell::new(overlayed_changes),
+						overlayed_changes: &overlayed_changes,
 						call_context: CallContext::Offchain,
 						recorder: &Some(recorder),
 						extensions: &RefCell::new(exts),
@@ -565,9 +601,39 @@ where
 
 					error_on_execution_failure(&info.exit_reason, &[])?;
 
-					let code = api
-						.account_code_at(substrate_hash, info.value)
+					// Read the deployed code back through the same overlay the creation
+					// call just wrote to, not through `api` (which is a separate, unrelated
+					// execution context and would never see the new contract's code).
+					let code_recorder: sp_trie::recorder::Recorder<HashingFor<B>> =
+						Default::default();
+					let code_ext =
+						sp_trie::proof_size_extension::ProofSizeExt::new(code_recorder.clone());
+					let mut code_exts = Extensions::new();
+					code_exts.register(code_ext);
+
+					let code_params = CallApiAtParams {
+						at: substrate_hash,
+						function: "EthereumRuntimeRPCApi_account_code_at",
+						arguments: Encode::encode(&info.value),
+						overlayed_changes: &overlayed_changes,
+						call_context: CallContext::Offchain,
+						recorder: &Some(code_recorder),
+						extensions: &RefCell::new(code_exts),
+					};
+					let code = self
+						.client
+						.call_api_at(code_params)
+						.and_then(|r| {
+							Result::map_err(<Vec<u8> as Decode>::decode(&mut &r[..]), |error| {
+								sp_api::ApiError::FailedToDecodeReturnValue {
+									function: "EthereumRuntimeRPCApi_account_code_at",
+									error,
+									raw: r,
+								}
+							})
+						})
 						.map_err(|err| internal_err(format!("runtime error: {err}")))?;
+
 					Ok(Bytes(code))
 				} else {
 					Err(internal_err("failed to retrieve Runtime Api version"))

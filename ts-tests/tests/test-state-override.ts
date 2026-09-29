@@ -227,8 +227,25 @@ describeWithFrontier("Frontier RPC (StateOverride)", (context) => {
 	});
 
 	it("should apply state overrides to a contract-creation eth_call", async function () {
-		// `otherAddress` is not funded in genesis, so a creation call transferring `value`
-		// from it fails unless a state override grants it a balance.
+		this.timeout(15000);
+		// Unlike `otherAddress`, this address is not seeded with a balance by any genesis or
+		// dev chain spec. It's given a real, negligible amount of funds (nowhere near enough to
+		// cover `value` below) purely so it has a system.account storage entry: the balance
+		// override is a no-op for an address that doesn't have one yet.
+		const unfundedAddress = "0x1200000000000000000000000000000000000042";
+		const seedTx = await context.web3.eth.accounts.signTransaction(
+			{
+				from: GENESIS_ACCOUNT,
+				to: unfundedAddress,
+				value: "0x1",
+				gasPrice: "0x3B9ACA00",
+				gas: "0x100000",
+			},
+			GENESIS_ACCOUNT_PRIVATE_KEY
+		);
+		await customRequest(context.web3, "eth_sendRawTransaction", [seedTx.rawTransaction]);
+		await createAndFinalizeBlock(context.web3);
+
 		const deployData = contract
 			.deploy({
 				data: STATE_OVERRIDE_TEST_CONTRACT_BYTECODE,
@@ -239,7 +256,7 @@ describeWithFrontier("Frontier RPC (StateOverride)", (context) => {
 
 		const { error: errorWithoutOverride } = await customRequest(context.web3, "eth_call", [
 			{
-				from: otherAddress,
+				from: unfundedAddress,
 				data: deployData,
 				value,
 			},
@@ -248,13 +265,13 @@ describeWithFrontier("Frontier RPC (StateOverride)", (context) => {
 
 		const { result, error } = await customRequest(context.web3, "eth_call", [
 			{
-				from: otherAddress,
+				from: unfundedAddress,
 				data: deployData,
 				value,
 			},
 			"latest",
 			{
-				[otherAddress]: {
+				[unfundedAddress]: {
 					balance: Web3.utils.numberToHex(Web3.utils.toWei("1000", "ether")),
 				},
 			},
