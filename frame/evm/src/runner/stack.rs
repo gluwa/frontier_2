@@ -297,8 +297,25 @@ where
 		let fee = T::OnChargeTransaction::withdraw_fee(&source, total_fee)
 			.map_err(|e| RunnerError { error: e, weight })?;
 
+		// For a real transaction the effective price the sender pays is `total_fee_per_gas`.
+		// Non-transactional calls (eth_call / eth_estimateGas) never withdraw a fee, so
+		// `total_fee_per_gas` is always zero there; derive GASPRICE instead from whatever
+		// fee fields the caller supplied for the simulation, falling back to the block
+		// base fee when none were given.
+		let effective_gas_price = if is_transactional {
+			total_fee_per_gas
+		} else {
+			match max_fee_per_gas {
+				Some(max_fee) => {
+					let priority_fee = max_priority_fee_per_gas.unwrap_or_default();
+					base_fee.saturating_add(max_fee.saturating_sub(base_fee).min(priority_fee))
+				}
+				None => base_fee,
+			}
+		};
+
 		let vicinity = Vicinity {
-			gas_price: total_fee_per_gas,
+			gas_price: effective_gas_price,
 			origin: source,
 		};
 

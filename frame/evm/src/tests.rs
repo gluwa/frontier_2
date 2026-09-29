@@ -1961,4 +1961,84 @@ mod gasprice_test {
 			assert_eq!(call_result.value, expected);
 		});
 	}
+
+	fn call_contract_non_transactional(
+		contract_addr: H160,
+		max_fee_per_gas: Option<U256>,
+		max_priority_fee_per_gas: Option<U256>,
+		gas_limit: u64,
+	) -> Result<CallInfo, crate::RunnerError<crate::Error<Test>>> {
+		<Test as Config>::Runner::call(
+			H160::default(),
+			contract_addr,
+			Vec::new(),
+			U256::zero(),
+			gas_limit,
+			max_fee_per_gas,
+			max_priority_fee_per_gas,
+			None,
+			Vec::new(),
+			Vec::new(),
+			false, // transactional
+			true,  // must be validated
+			None,
+			Some(0),
+			<Test as Config>::config(),
+		)
+	}
+
+	#[test]
+	fn gasprice_non_transactional_uses_supplied_fee_fields() {
+		new_test_ext().execute_with(|| {
+			let gas_limit: u64 = 1_000_000;
+			let (base_fee, _) = <Test as Config>::FeeCalculator::min_gas_price();
+			let max_fee_per_gas = U256::from(2_000_000_000u128);
+			let tip = U256::from(500_000_000u128);
+
+			let contract_addr = deploy(max_fee_per_gas, gas_limit);
+			let call_result = call_contract_non_transactional(
+				contract_addr,
+				Some(max_fee_per_gas),
+				Some(tip),
+				gas_limit,
+			)
+			.expect("non-transactional call should succeed");
+			assert_eq!(
+				call_result.exit_reason,
+				crate::ExitReason::Succeed(ExitSucceed::Returned)
+			);
+
+			let effective_gas_price = base_fee + (max_fee_per_gas - base_fee).min(tip);
+			assert_ne!(
+				effective_gas_price, base_fee,
+				"test is only meaningful with a nonzero realized priority fee"
+			);
+
+			let expected = [effective_gas_price.to_big_endian(), base_fee.to_big_endian()].concat();
+
+			assert_eq!(call_result.value, expected);
+		});
+	}
+
+	#[test]
+	fn gasprice_non_transactional_defaults_to_basefee_when_no_fee_fields_supplied() {
+		new_test_ext().execute_with(|| {
+			let gas_limit: u64 = 1_000_000;
+			let (base_fee, _) = <Test as Config>::FeeCalculator::min_gas_price();
+			let max_fee_per_gas = U256::from(2_000_000_000u128);
+
+			let contract_addr = deploy(max_fee_per_gas, gas_limit);
+			let call_result =
+				call_contract_non_transactional(contract_addr, None, None, gas_limit)
+					.expect("non-transactional call should succeed");
+			assert_eq!(
+				call_result.exit_reason,
+				crate::ExitReason::Succeed(ExitSucceed::Returned)
+			);
+
+			let expected = [base_fee.to_big_endian(), base_fee.to_big_endian()].concat();
+
+			assert_eq!(call_result.value, expected);
+		});
+	}
 }
