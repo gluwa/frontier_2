@@ -266,7 +266,7 @@ describeWithFrontier("Frontier RPC (RPC execution)", (context) => {
 });
 
 describeWithFrontier("Frontier RPC (estimate gas shortcut)", (context) => {
-	const NO_CODE_ADDRESS = "0x1230000000000000000000000000000000000a";
+	const NO_CODE_ADDRESS = "0x120000000000000000000000000000000000000a";
 
 	step("uses the flat minimum-gas shortcut for a plain simple transfer", async function () {
 		const estimate = await customRequest(context.web3, "eth_estimateGas", [
@@ -287,7 +287,7 @@ describeWithFrontier("Frontier RPC (estimate gas shortcut)", (context) => {
 				value: "0x1",
 				accessList: [
 					{
-						address: "0x1230000000000000000000000000000000000b",
+						address: "0x120000000000000000000000000000000000000b",
 						storageKeys: ["0x" + "00".repeat(31) + "01"],
 					},
 				],
