@@ -226,6 +226,60 @@ describeWithFrontier("Frontier RPC (StateOverride)", (context) => {
 		expect(Web3.utils.hexToNumberString(result2)).to.equal("0");
 	});
 
+	it("should apply state overrides to a contract-creation eth_call", async function () {
+		this.timeout(15000);
+		// Unlike `otherAddress`, this address is not seeded with a balance by any genesis or
+		// dev chain spec. It's given a real, negligible amount of funds (nowhere near enough to
+		// cover `value` below) purely so it has a system.account storage entry: the balance
+		// override is a no-op for an address that doesn't have one yet.
+		const unfundedAddress = "0x1200000000000000000000000000000000000042";
+		const seedTx = await context.web3.eth.accounts.signTransaction(
+			{
+				from: GENESIS_ACCOUNT,
+				to: unfundedAddress,
+				value: "0x1",
+				gasPrice: "0x3B9ACA00",
+				gas: "0x100000",
+			},
+			GENESIS_ACCOUNT_PRIVATE_KEY
+		);
+		await customRequest(context.web3, "eth_sendRawTransaction", [seedTx.rawTransaction]);
+		await createAndFinalizeBlock(context.web3);
+
+		const deployData = contract
+			.deploy({
+				data: STATE_OVERRIDE_TEST_CONTRACT_BYTECODE,
+				arguments: [100],
+			})
+			.encodeABI();
+		const value = Web3.utils.numberToHex(Web3.utils.toWei("1", "ether"));
+
+		const { error: errorWithoutOverride } = await customRequest(context.web3, "eth_call", [
+			{
+				from: unfundedAddress,
+				data: deployData,
+				value,
+			},
+		]);
+		expect(errorWithoutOverride, "creation should fail without a balance override").to.exist;
+
+		const { result, error } = await customRequest(context.web3, "eth_call", [
+			{
+				from: unfundedAddress,
+				data: deployData,
+				value,
+			},
+			"latest",
+			{
+				[unfundedAddress]: {
+					balance: Web3.utils.numberToHex(Web3.utils.toWei("1000", "ether")),
+				},
+			},
+		]);
+		expect(error, "creation should succeed once the sender balance is overridden").to.not.exist;
+		expect(result).to.equal(StateOverrideTest.deployedBytecode);
+	});
+
 	it("should set MultiplyBy7 deployedBytecode with state override", async function () {
 		const testContract = new context.web3.eth.Contract(Test.abi as AbiItem[]);
 		const { result } = await customRequest(context.web3, "eth_call", [
