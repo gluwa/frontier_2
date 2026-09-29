@@ -386,6 +386,11 @@ impl pallet_evm::Config for Runtime {
 	type WeightInfo = pallet_evm::weights::SubstrateWeight<Self>;
 }
 
+/// Returns `true` if `address` is one of this runtime's registered precompiles.
+pub fn is_precompile(address: H160) -> bool {
+	FrontierPrecompiles::<Runtime>::used_addresses().contains(&address)
+}
+
 parameter_types! {
 	pub const PostBlockAndTxnHashes: PostLogContent = PostLogContent::BlockAndTxnHashes;
 }

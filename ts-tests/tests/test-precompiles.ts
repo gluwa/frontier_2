@@ -74,4 +74,16 @@ describeWithFrontier("Frontier RPC (Precompile)", (context) => {
 		});
 		assert.equal(callResult, message);
 	});
+
+	it("should not use the flat minimum-gas shortcut when estimating gas for a precompile", async () => {
+		// A call to a precompile has empty account code, just like a plain transfer to an EOA,
+		// but it still executes and consumes gas beyond the flat 21000 minimum.
+		const estimate = await customRequest(context.web3, "eth_estimateGas", [
+			{
+				from: GENESIS_ACCOUNT,
+				to: "0x0000000000000000000000000000000000000004", // identity precompile
+			},
+		]);
+		expect(context.web3.utils.hexToNumber(estimate.result)).to.be.above(21000);
+	});
 });

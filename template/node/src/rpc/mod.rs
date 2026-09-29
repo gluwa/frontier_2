@@ -16,6 +16,7 @@ use sc_service::TransactionPool;
 use sp_api::{CallApiAt, ProvideRuntimeApi};
 use sp_blockchain::{Error as BlockChainError, HeaderBackend, HeaderMetadata};
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
+use sp_core::H160;
 use sp_inherents::CreateInherentDataProviders;
 use sp_runtime::traits::Block as BlockT;
 // Runtime
@@ -47,6 +48,10 @@ where
 	type EstimateGasAdapter = ();
 	type RuntimeStorageOverride =
 		fc_rpc::frontier_backend_client::SystemAccountId20StorageOverride<B, C, BE>;
+
+	fn is_precompile(address: H160) -> bool {
+		frontier_template_runtime::is_precompile(address)
+	}
 }
 
 /// Instantiate all Full RPC extensions.
