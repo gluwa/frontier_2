@@ -101,7 +101,9 @@ impl PubSubResult {
 				gas_limit: block.header.gas_limit,
 				extra_data: Bytes(block.header.extra_data.clone()),
 				logs_bloom: block.header.logs_bloom,
-				timestamp: U256::from(block.header.timestamp),
+				// `header.timestamp` is stored in milliseconds; JSON-RPC expects seconds
+				// (same conversion as `rich_block_build`).
+				timestamp: U256::from(block.header.timestamp / 1000),
 				difficulty: block.header.difficulty,
 				nonce: Some(block.header.nonce),
 				size: Some(U256::from(rlp::encode(&block.header).len() as u32)),
