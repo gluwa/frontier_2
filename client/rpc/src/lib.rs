@@ -77,6 +77,73 @@ pub mod frontier_backend_client {
 	// Frontier
 	use fc_rpc_core::types::BlockNumberOrHash;
 
+	/// SCALE encoding of `frame_system::AccountInfo<u32, pallet_balances::AccountData<u128>>`:
+	/// `nonce`, `consumers`, `providers`, `sufficients` (`u32` each) followed by `free`,
+	/// `reserved`, `frozen` and `flags` (`u128` each).
+	const ACCOUNT_INFO_LEN: usize = 80;
+	const ACCOUNT_NONCE: std::ops::Range<usize> = 0..4;
+	const ACCOUNT_PROVIDERS: std::ops::Range<usize> = 8..12;
+	const ACCOUNT_FREE: std::ops::Range<usize> = 16..32;
+
+	/// Encoded `AccountInfo::default()`. Everything is zero except `AccountData::flags`, which
+	/// defaults to `ExtraFlags::IS_NEW_LOGIC` (the most significant bit) rather than zero.
+	fn default_account_info() -> Vec<u8> {
+		let mut item = vec![0u8; ACCOUNT_INFO_LEN];
+		item[ACCOUNT_INFO_LEN - 1] = 0x80;
+		item
+	}
+
+	/// Applies `balance` and `nonce` on top of the `System::Account` record of `account_id`.
+	///
+	/// An account that is absent from state gets a default record to apply them on, so that
+	/// overriding a previously unused address takes effect. Nothing is written for an absent
+	/// account when neither field is overridden.
+	fn override_system_account<B, C, BE>(
+		client: &C,
+		overlayed_changes: &mut OverlayedChanges<HashingFor<B>>,
+		block: B::Hash,
+		account_id: &[u8],
+		balance: Option<U256>,
+		nonce: Option<U256>,
+	) where
+		B: BlockT,
+		C: StorageProvider<B, BE> + Send + Sync,
+		BE: Backend<B>,
+	{
+		let mut key = [twox_128(b"System"), twox_128(b"Account")]
+			.concat()
+			.to_vec();
+		key.extend(blake2_128(account_id));
+		key.extend(account_id);
+
+		let mut new_item = match client.storage(block, &StorageKey(key.clone())) {
+			Ok(Some(item)) => item.0,
+			Ok(None) if balance.is_some() || nonce.is_some() => {
+				let mut item = default_account_info();
+				// A funded account is kept alive by a provider reference, as it would be on chain.
+				if balance.is_some_and(|balance| !balance.is_zero()) {
+					item.splice(ACCOUNT_PROVIDERS, 1u32.encode());
+				}
+				item
+			}
+			Ok(None) => return,
+			Err(e) => {
+				log::warn!(target: "rpc", "Failed to read System::Account for a state override: {e:?}");
+				return;
+			}
+		};
+
+		if let Some(nonce) = nonce {
+			new_item.splice(ACCOUNT_NONCE, nonce.low_u32().encode());
+		}
+
+		if let Some(balance) = balance {
+			new_item.splice(ACCOUNT_FREE, balance.low_u128().encode());
+		}
+
+		overlayed_changes.set_storage(key, Some(new_item));
+	}
+
 	/// Implements a default runtime storage override.
 	/// It assumes that the balances and nonces are stored in pallet `system.account`, and
 	/// have `nonce: Index` = `u32` for  and `free: Balance` = `u128`.
@@ -101,26 +168,15 @@ pub mod frontier_backend_client {
 			balance: Option<U256>,
 			nonce: Option<U256>,
 		) {
-			let mut key = [twox_128(b"System"), twox_128(b"Account")]
-				.concat()
-				.to_vec();
 			let account_id = Self::into_account_id_bytes(address);
-			key.extend(blake2_128(&account_id));
-			key.extend(&account_id);
-
-			if let Ok(Some(item)) = client.storage(block, &StorageKey(key.clone())) {
-				let mut new_item = item.0;
-
-				if let Some(nonce) = nonce {
-					new_item.splice(0..4, nonce.low_u32().encode());
-				}
-
-				if let Some(balance) = balance {
-					new_item.splice(16..32, balance.low_u128().encode());
-				}
-
-				overlayed_changes.set_storage(key, Some(new_item));
-			}
+			override_system_account::<B, C, BE>(
+				client,
+				overlayed_changes,
+				block,
+				&account_id,
+				balance,
+				nonce,
+			);
 		}
 
 		fn into_account_id_bytes(address: H160) -> Vec<u8> {
@@ -154,26 +210,15 @@ pub mod frontier_backend_client {
 			balance: Option<U256>,
 			nonce: Option<U256>,
 		) {
-			let mut key = [twox_128(b"System"), twox_128(b"Account")]
-				.concat()
-				.to_vec();
 			let account_id = Self::into_account_id_bytes(address);
-			key.extend(blake2_128(&account_id));
-			key.extend(&account_id);
-
-			if let Ok(Some(item)) = client.storage(block, &StorageKey(key.clone())) {
-				let mut new_item = item.0;
-
-				if let Some(nonce) = nonce {
-					new_item.splice(0..4, nonce.low_u32().encode());
-				}
-
-				if let Some(balance) = balance {
-					new_item.splice(16..32, balance.low_u128().encode());
-				}
-
-				overlayed_changes.set_storage(key, Some(new_item));
-			}
+			override_system_account::<B, C, BE>(
+				client,
+				overlayed_changes,
+				block,
+				&account_id,
+				balance,
+				nonce,
+			);
 		}
 
 		fn into_account_id_bytes(address: H160) -> Vec<u8> {
@@ -519,5 +564,167 @@ mod tests {
 			.unwrap(),
 			b2_hash,
 		);
+	}
+
+	mod system_account_override {
+		use super::*;
+		use ethereum_types::{H160, U256};
+		use fp_rpc::RuntimeStorageOverride;
+		use sc_client_api::StorageProvider;
+		use scale_codec::Encode;
+		use sp_io::hashing::{blake2_128, twox_128};
+		use sp_runtime::traits::HashingFor;
+		use sp_state_machine::OverlayedChanges;
+		use substrate_test_runtime_client::{
+			runtime::{Block as TestBlock, Hash},
+			Backend, Client,
+		};
+
+		use crate::frontier_backend_client::{
+			SystemAccountId20StorageOverride, SystemAccountId32StorageOverride,
+		};
+
+		type TestClient = Client<Backend>;
+		type Id20 = SystemAccountId20StorageOverride<TestBlock, TestClient, Backend>;
+		type Id32 = SystemAccountId32StorageOverride<TestBlock, TestClient, Backend>;
+
+		// `AccountInfo { nonce, consumers, providers, sufficients, data: AccountData { free,
+		// reserved, frozen, flags } }`, where `flags` defaults to `IS_NEW_LOGIC`.
+		type AccountInfo = (u32, u32, u32, u32, u128, u128, u128, u128);
+		const IS_NEW_LOGIC: u128 = 1 << 127;
+
+		const ADDRESS: H160 = H160([0x12; 20]);
+
+		fn account_key(account_id: &[u8]) -> Vec<u8> {
+			let mut key = [twox_128(b"System"), twox_128(b"Account")].concat();
+			key.extend(blake2_128(account_id));
+			key.extend(account_id);
+			key
+		}
+
+		fn new_client() -> Arc<TestClient> {
+			let (client, _) = TestClientBuilder::new()
+				.build_with_native_executor::<substrate_test_runtime_client::runtime::RuntimeApi, _>(
+				None,
+			);
+			Arc::new(client)
+		}
+
+		/// Imports a block that writes `value` under `key`, returning the new block hash.
+		fn import_storage(client: &Arc<TestClient>, key: Vec<u8>, value: Vec<u8>) -> Hash {
+			let chain = client.chain_info();
+			let mut builder = BlockBuilderBuilder::new(&**client)
+				.on_parent_block(chain.best_hash)
+				.with_parent_block_number(chain.best_number)
+				.build()
+				.unwrap();
+			builder.push_storage_change(key, Some(value)).unwrap();
+			let block = builder.build().unwrap().block;
+			let hash = block.header.hash();
+			executor::block_on(client.import(BlockOrigin::Own, block)).unwrap();
+			hash
+		}
+
+		/// Runs the override for `ADDRESS` at `block` and returns the `System::Account` value it
+		/// wrote to the overlay, if any.
+		fn overridden_account<O: RuntimeStorageOverride<TestBlock, TestClient>>(
+			client: &TestClient,
+			block: Hash,
+			balance: Option<u128>,
+			nonce: Option<u32>,
+		) -> Option<AccountInfo> {
+			let mut overlay = OverlayedChanges::<HashingFor<TestBlock>>::default();
+			O::set_overlayed_changes(
+				client,
+				&mut overlay,
+				block,
+				6,
+				ADDRESS,
+				balance.map(U256::from),
+				nonce.map(U256::from),
+			);
+			let key = account_key(&O::into_account_id_bytes(ADDRESS));
+			overlay
+				.storage(&key)
+				.flatten()
+				.map(|value| scale_codec::Decode::decode(&mut &value[..]).unwrap())
+		}
+
+		fn absent_account_override<O: RuntimeStorageOverride<TestBlock, TestClient>>() {
+			let client = new_client();
+			let best = client.chain_info().best_hash;
+			let key = account_key(&O::into_account_id_bytes(ADDRESS));
+			assert!(
+				client
+					.storage(best, &sp_storage::StorageKey(key))
+					.unwrap()
+					.is_none(),
+				"the account must be absent for this test"
+			);
+
+			// Balance and nonce: a funded account is kept alive by a provider reference.
+			assert_eq!(
+				overridden_account::<O>(&client, best, Some(1_000), Some(7)),
+				Some((7, 0, 1, 0, 1_000, 0, 0, IS_NEW_LOGIC)),
+			);
+			// Balance only.
+			assert_eq!(
+				overridden_account::<O>(&client, best, Some(1_000), None),
+				Some((0, 0, 1, 0, 1_000, 0, 0, IS_NEW_LOGIC)),
+			);
+			// Nonce only.
+			assert_eq!(
+				overridden_account::<O>(&client, best, None, Some(7)),
+				Some((7, 0, 0, 0, 0, 0, 0, IS_NEW_LOGIC)),
+			);
+			// A zero balance does not fund the account.
+			assert_eq!(
+				overridden_account::<O>(&client, best, Some(0), None),
+				Some((0, 0, 0, 0, 0, 0, 0, IS_NEW_LOGIC)),
+			);
+			// Nothing to override: no account is conjured up (e.g. a code-only override).
+			assert_eq!(overridden_account::<O>(&client, best, None, None), None);
+		}
+
+		fn existing_account_override<O: RuntimeStorageOverride<TestBlock, TestClient>>() {
+			let client = new_client();
+			let key = account_key(&O::into_account_id_bytes(ADDRESS));
+			let existing: AccountInfo = (3, 4, 5, 6, 100, 200, 300, IS_NEW_LOGIC);
+			let block = import_storage(&client, key, existing.encode());
+
+			// Only the overridden fields change; the rest of the record is retained.
+			assert_eq!(
+				overridden_account::<O>(&client, block, Some(1_000), Some(7)),
+				Some((7, 4, 5, 6, 1_000, 200, 300, IS_NEW_LOGIC)),
+			);
+			assert_eq!(
+				overridden_account::<O>(&client, block, Some(1_000), None),
+				Some((3, 4, 5, 6, 1_000, 200, 300, IS_NEW_LOGIC)),
+			);
+			assert_eq!(
+				overridden_account::<O>(&client, block, None, Some(7)),
+				Some((7, 4, 5, 6, 100, 200, 300, IS_NEW_LOGIC)),
+			);
+		}
+
+		#[test]
+		fn id20_overrides_absent_account() {
+			absent_account_override::<Id20>();
+		}
+
+		#[test]
+		fn id32_overrides_absent_account() {
+			absent_account_override::<Id32>();
+		}
+
+		#[test]
+		fn id20_overrides_existing_account() {
+			existing_account_override::<Id20>();
+		}
+
+		#[test]
+		fn id32_overrides_existing_account() {
+			existing_account_override::<Id32>();
+		}
 	}
 }
