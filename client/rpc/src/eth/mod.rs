@@ -655,7 +655,9 @@ fn transaction_build(
 
 	let mut transaction: Transaction = Transaction::build_from(from, ethereum_transaction);
 
-	if let EthereumTransaction::EIP1559(_) = ethereum_transaction {
+	// EIP-1559 and EIP-7702 transactions share the same fee market rules.
+	if let EthereumTransaction::EIP1559(_) | EthereumTransaction::EIP7702(_) = ethereum_transaction
+	{
 		if block.is_none() && status.is_none() {
 			// If transaction is not mined yet, gas price is considered just max fee per gas.
 		} else {

@@ -344,6 +344,22 @@ fn eip1559_tx(max_priority_fee_per_gas: u64, max_fee_per_gas: u64) -> EthereumTr
 	})
 }
 
+fn eip7702_tx(max_priority_fee_per_gas: u64, max_fee_per_gas: u64) -> EthereumTransaction {
+	EthereumTransaction::EIP7702(ethereum::EIP7702Transaction {
+		chain_id: 42,
+		nonce: U256::zero(),
+		max_priority_fee_per_gas: U256::from(max_priority_fee_per_gas),
+		max_fee_per_gas: U256::from(max_fee_per_gas),
+		gas_limit: U256::from(TX_GAS),
+		destination: TransactionAction::Call(H160::repeat_byte(1)),
+		value: U256::zero(),
+		data: Vec::new(),
+		access_list: Vec::new(),
+		authorization_list: Vec::new(),
+		signature: signature(),
+	})
+}
+
 fn legacy_tx(gas_price: u64) -> EthereumTransaction {
 	EthereumTransaction::Legacy(ethereum::LegacyTransaction {
 		nonce: U256::zero(),
@@ -517,6 +533,45 @@ fn block_transaction_and_fee_history_agree_on_the_execution_base_fee() {
 		assert_eq!(cache_item.rewards[100], sorted_tips[1]);
 		assert_eq!(cache_item.rewards[150], sorted_tips[2]);
 		assert_eq!(cache_item.rewards[200], sorted_tips[3]);
+	}
+}
+
+/// Mined EIP-7702 transactions report the effective gas price like EIP-1559 ones, not their fee cap.
+#[test]
+fn mined_eip7702_transaction_reports_the_effective_gas_price() {
+	for executed_with in FEES_EXECUTED_WITH {
+		// Zero tip, nonzero tip below the fee cap, and a tip limited by the fee cap.
+		for (tip, fee_cap) in [(0u64, 2_000u64), (7, 2_000), (50, 1_130)] {
+			let transaction = eip7702_tx(tip, fee_cap);
+			let block = build_block(1, vec![transaction.clone()]);
+			let statuses = build_statuses(1);
+			let mined = transaction_build(
+				&transaction,
+				Some(&block),
+				statuses[0].as_ref(),
+				Some(U256::from(executed_with)),
+			);
+			assert_eq!(
+				mined.gas_price,
+				Some(U256::from((executed_with + tip).min(fee_cap))),
+				"base fee {executed_with} tip {tip} fee cap {fee_cap}"
+			);
+			assert_eq!(mined.max_fee_per_gas, Some(U256::from(fee_cap)));
+			assert_eq!(mined.max_priority_fee_per_gas, Some(U256::from(tip)));
+			// The receipt computes the same price from the same base fee.
+			assert_eq!(
+				mined.gas_price,
+				Some(eip1559_effective_gas_price(
+					U256::from(executed_with),
+					U256::from(tip),
+					U256::from(fee_cap),
+				))
+			);
+
+			// Not mined yet: the price is the fee cap.
+			let pending = transaction_build(&transaction, None, None, None);
+			assert_eq!(pending.gas_price, Some(U256::from(fee_cap)));
+		}
 	}
 }
 
