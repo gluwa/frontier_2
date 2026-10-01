@@ -61,7 +61,7 @@ where
 					statuses.into_iter().map(Option::Some).collect(),
 					Some(hash),
 					full,
-					Some(base_fee),
+					base_fee,
 					false,
 				);
 

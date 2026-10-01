@@ -536,6 +536,38 @@ fn block_transaction_and_fee_history_agree_on_the_execution_base_fee() {
 	}
 }
 
+/// When the execution base fee cannot be determined, the block does not report a base fee (rather
+/// than a fee that was not used) and mined transactions account for their tip only.
+#[test]
+fn block_without_a_known_execution_base_fee_does_not_report_one() {
+	// State of block 1 is not available, so the fee block 2 was executed with is unknown.
+	let (chain, client) = mock_client(&[Some(1_000), None, Some(1_125)]);
+	let base_fee = execution_base_fee::<Block, _>(&client, chain.hash(2));
+	assert_eq!(base_fee, None);
+
+	let transactions = transactions();
+	let block = build_block(2, transactions.clone());
+	let rich_block = rich_block_build(
+		block,
+		build_statuses(transactions.len()),
+		None,
+		true,
+		base_fee,
+		false,
+	);
+	assert_eq!(rich_block.inner.base_fee_per_gas, None);
+
+	let BlockTransactions::Full(rpc_transactions) = &rich_block.inner.transactions else {
+		panic!("full transactions were requested");
+	};
+	let prices: Vec<_> = rpc_transactions.iter().map(|t| t.gas_price).collect();
+	assert_eq!(
+		prices,
+		// The tip of each EIP-1559 transaction and the gas price of the legacy one.
+		[0, 7, 50, 1_130].map(|price| Some(U256::from(price))),
+	);
+}
+
 /// Mined EIP-7702 transactions report the effective gas price like EIP-1559 ones, not their fee cap.
 #[test]
 fn mined_eip7702_transaction_reports_the_effective_gas_price() {

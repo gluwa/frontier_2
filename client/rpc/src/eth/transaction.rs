@@ -125,7 +125,7 @@ where
 				&block.transactions[index],
 				Some(&block),
 				Some(&statuses[index]),
-				Some(base_fee),
+				base_fee,
 			))),
 			_ => Ok(None),
 		}
@@ -153,7 +153,7 @@ where
 						transaction,
 						Some(&block),
 						Some(status),
-						Some(base_fee),
+						base_fee,
 					)))
 				} else {
 					Err(internal_err(format!("{index:?} is out of bounds")))
@@ -185,7 +185,7 @@ where
 						transaction,
 						Some(&block),
 						Some(status),
-						Some(base_fee),
+						base_fee,
 					)))
 				} else {
 					Err(internal_err(format!("{index:?} is out of bounds")))
@@ -276,6 +276,8 @@ where
 				cumulative_receipts.truncate((status.transaction_index + 1) as usize);
 				let transaction = block.transactions[index].clone();
 				// `base_fee` is the fee the block was executed with, not the one it left for the next block.
+				// When it cannot be determined, only the tip is accounted for.
+				let base_fee = base_fee.unwrap_or_default();
 				let effective_gas_price = match &transaction {
 					EthereumTransaction::Legacy(t) => t.gas_price,
 					EthereumTransaction::EIP2930(t) => t.gas_price,

@@ -238,8 +238,7 @@ where
 			.await;
 		let receipts = self.storage_override.current_receipts(substrate_hash);
 		let is_eip1559 = self.storage_override.is_eip1559(substrate_hash);
-		let base_fee = fee::execution_base_fee::<B, C>(self.client.as_ref(), substrate_hash)
-			.unwrap_or_default();
+		let base_fee = fee::execution_base_fee::<B, C>(self.client.as_ref(), substrate_hash);
 
 		Ok(BlockInfo::new(
 			block,
@@ -697,7 +696,9 @@ pub struct BlockInfo<H> {
 	statuses: Option<Vec<TransactionStatus>>,
 	substrate_hash: H,
 	is_eip1559: bool,
-	base_fee: U256,
+	/// The base fee the block was executed with, `None` when it cannot be determined (e.g. the
+	/// state of the parent block is pruned).
+	base_fee: Option<U256>,
 }
 
 impl<H> BlockInfo<H> {
@@ -707,7 +708,7 @@ impl<H> BlockInfo<H> {
 		statuses: Option<Vec<TransactionStatus>>,
 		substrate_hash: H,
 		is_eip1559: bool,
-		base_fee: U256,
+		base_fee: Option<U256>,
 	) -> Self {
 		Self {
 			block,
