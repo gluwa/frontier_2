@@ -260,13 +260,43 @@ fn next_base_fee(last_base_fee: U256, gas_used_ratio: f64, elasticity: f64) -> U
 }
 
 /// `base_fee * factor`, rounded down. Saturates at `U256::MAX`.
+///
+/// The product is exact: a finite `f64` is `mantissa * 2^exponent` with a 53 bit mantissa, so it is
+/// applied as an integer multiplication followed by a shift. NaN, zero and negative factors scale
+/// to zero.
 fn scale_base_fee(base_fee: U256, factor: f64) -> U256 {
-	/// Fixed point denominator the factor is expressed in.
-	const DENOMINATOR: u64 = 1_000_000_000_000_000_000;
+	if base_fee.is_zero() || factor.is_nan() || factor <= 0.0 {
+		return U256::zero();
+	}
+	if factor.is_infinite() {
+		return U256::MAX;
+	}
 
-	// Float to int casts saturate, and map NaN to zero.
-	let numerator = (factor * DENOMINATOR as f64) as u128;
-	let scaled = base_fee.full_mul(U256::from(numerator)) / U512::from(DENOMINATOR);
+	let bits = factor.to_bits();
+	let biased_exponent = ((bits >> 52) & 0x7ff) as i32;
+	let fraction = bits & ((1u64 << 52) - 1);
+	// Normal numbers have an implicit leading bit, subnormal ones do not.
+	let (mantissa, exponent) = if biased_exponent == 0 {
+		(fraction, -1074)
+	} else {
+		(fraction | (1u64 << 52), biased_exponent - 1075)
+	};
+
+	let product = base_fee.full_mul(U256::from(mantissa));
+	let scaled = if exponent < 0 {
+		let shift = exponent.unsigned_abs();
+		if shift >= 512 {
+			U512::zero()
+		} else {
+			product >> shift
+		}
+	} else {
+		let shift = exponent as u32;
+		if product.bits() + shift as usize > 256 {
+			return U256::MAX;
+		}
+		product << shift
+	};
 	U256::try_from(scaled).unwrap_or(U256::MAX)
 }
 
@@ -378,6 +408,52 @@ mod precision_tests {
 			assert_eq!(
 				next_base_fee(base_fee, 0.0, ELASTICITY),
 				base_fee - base_fee / 8
+			);
+		}
+	}
+
+	#[test]
+	fn scale_base_fee_is_exact() {
+		for base_fee in base_fees() {
+			assert_eq!(scale_base_fee(base_fee, 1.0), base_fee);
+			assert_eq!(scale_base_fee(base_fee, 0.75), base_fee * 3 / 4);
+			assert_eq!(scale_base_fee(base_fee, 0.125), base_fee / 8);
+			assert_eq!(scale_base_fee(base_fee, 2.0), base_fee * 2);
+			// Factors below `1e-18` are not rounded to a multiple of it.
+			assert_eq!(scale_base_fee(base_fee, 2f64.powi(-55)), base_fee >> 55);
+			// 0.1 is 3602879701896397 / 2^55 as an `f64`.
+			assert_eq!(
+				scale_base_fee(base_fee, 0.1),
+				U256::try_from(base_fee.full_mul(U256::from(3_602_879_701_896_397u64)) >> 55)
+					.unwrap()
+			);
+		}
+	}
+
+	#[test]
+	fn scale_base_fee_saturates_and_never_panics() {
+		let one = U256::one();
+		assert_eq!(scale_base_fee(one, 2f64.powi(255)), one << 255);
+		assert_eq!(scale_base_fee(one, 2f64.powi(256)), U256::MAX);
+		assert_eq!(scale_base_fee(U256::MAX, 2.0), U256::MAX);
+		assert_eq!(scale_base_fee(U256::MAX, f64::MAX), U256::MAX);
+		assert_eq!(scale_base_fee(U256::MAX, f64::INFINITY), U256::MAX);
+		assert_eq!(scale_base_fee(U256::zero(), f64::INFINITY), U256::zero());
+		// Subnormal, zero, negative and NaN factors.
+		assert_eq!(scale_base_fee(U256::MAX, f64::from_bits(1)), U256::zero());
+		assert_eq!(scale_base_fee(U256::MAX, 0.0), U256::zero());
+		assert_eq!(scale_base_fee(U256::MAX, -0.5), U256::zero());
+		assert_eq!(scale_base_fee(U256::MAX, f64::NAN), U256::zero());
+	}
+
+	#[test]
+	fn next_base_fee_keeps_small_adjustments() {
+		// The smallest ratio above the target moves the fee by `fee * 2^-55`.
+		let ratio = f64::from_bits(0.5f64.to_bits() + 1);
+		for base_fee in base_fees() {
+			assert_eq!(
+				next_base_fee(base_fee, ratio, ELASTICITY),
+				base_fee + (base_fee >> 55)
 			);
 		}
 	}
