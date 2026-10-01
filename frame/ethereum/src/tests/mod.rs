@@ -29,6 +29,7 @@ use crate::{
 };
 use fp_self_contained::CheckedExtrinsic;
 
+mod blockhash;
 mod eip1559;
 mod eip2930;
 mod eip7702;

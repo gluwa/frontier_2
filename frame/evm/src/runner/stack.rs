@@ -55,6 +55,9 @@ use crate::{
 	Error, Event, FeeCalculator, OnChargeEVMTransaction, OnCreate, Pallet, RunnerError,
 };
 
+/// Number of most recent ancestor blocks whose hash the BLOCKHASH opcode may return.
+const BLOCK_HASH_WINDOW: u64 = 256;
+
 // IMPORTANT: This function is a placeholder for the ProofSizeExt host-function, so that
 // we can update to 2512 without requiring validators to update their nodes to a version that supports the ProofSizeExt host-function.
 // IT SHOULD BE REPLACED ONCE WE DECIDE TO REQUIRE THE PROOFSIZE HOST-FUNCTION
@@ -1088,7 +1091,15 @@ where
 	}
 
 	fn block_hash(&self, number: U256) -> H256 {
-		if number > U256::from(u32::MAX) {
+		// BLOCKHASH only exposes the hashes of the most recent `BLOCK_HASH_WINDOW` complete
+		// blocks, i.e. `current - BLOCK_HASH_WINDOW <= number < current`. Anything outside of
+		// that range yields zero, even when the mapping still retains an entry for it (e.g. the
+		// genesis hash, which is kept for other consumers).
+		let current = self.block_number();
+		if number >= current
+			|| number < current.saturating_sub(U256::from(BLOCK_HASH_WINDOW))
+			|| number > U256::from(u32::MAX)
+		{
 			H256::default()
 		} else {
 			T::BlockHashMapping::block_hash(number.as_u32())
