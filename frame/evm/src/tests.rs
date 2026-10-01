@@ -720,6 +720,63 @@ mod proof_size_test {
 	}
 
 	#[test]
+	fn dispatched_call_is_rejected_when_encoded_call_exceeds_proof_size_limit() {
+		new_test_ext().execute_with(|| {
+			System::set_block_number(1);
+
+			let ratio = <<Test as Config>::GasLimitPovSizeRatio as Get<u64>>::get();
+			let target = H160::random();
+			let value = U256::from(777);
+			let input = vec![0u8; 10_000];
+
+			// The gas limit pays for the call data, including its floor cost, but the proof size
+			// derived from it can not fit the encoded call.
+			let gas_limit = 21_000 + 10 * input.len() as u64;
+			assert!(gas_limit / ratio < input.len() as u64);
+
+			// Without a proof size limit the call is valid.
+			<Test as Config>::Runner::validate(
+				H160::default(),
+				Some(target),
+				input.clone(),
+				value,
+				gas_limit,
+				Some(FixedGasPrice::min_gas_price().0),
+				None,
+				None,
+				Vec::new(),
+				Vec::new(),
+				true,
+				None,
+				None,
+				<Test as Config>::config(),
+			)
+			.expect("call is valid without a proof size limit");
+
+			let err = dispatch_call(target, input.clone(), value, gas_limit)
+				.expect_err("call is rejected");
+			assert_eq!(err.error, crate::Error::<Test>::GasLimitTooLow.into());
+			// The call is rejected before any execution, so only the validation is accounted for,
+			// not the weight derived from the gas limit.
+			let declared_weight = FixedGasWeightMapping::<Test>::gas_to_weight(gas_limit, true);
+			assert!(err
+				.post_info
+				.actual_weight
+				.expect("actual weight")
+				.all_lt(declared_weight));
+			assert_eq!(err.post_info.pays_fee, frame_support::dispatch::Pays::Yes);
+			assert_eq!(EVM::account_basic(&target).0.balance, U256::zero());
+			assert!(System::events().is_empty());
+
+			// The same call is executed when the proof size limit fits the encoded call.
+			let gas_limit = gas_limit.max(ratio * (input.len() as u64 + 1_000));
+			assert_ok!(dispatch_call(target, input, value, gas_limit));
+			System::assert_has_event(crate::Event::<Test>::Executed { address: target }.into());
+			assert_eq!(EVM::account_basic(&target).0.balance, value);
+		});
+	}
+
+	#[test]
 	fn dispatched_call_reports_dynamic_proof_size() {
 		new_test_ext().execute_with(|| {
 			let gas_limit: u64 = 1_000_000;
