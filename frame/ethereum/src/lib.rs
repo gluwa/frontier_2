@@ -268,7 +268,9 @@ pub mod pallet {
 			if let Ok(log) = fp_consensus::find_pre_log(&frame_system::Pallet::<T>::digest()) {
 				let PreLog::Block(block) = log;
 
+				// The block gas limit may be an adjustment algorithm backed by storage.
 				let block_gas_limit = T::BlockGasLimit::get();
+				weight = weight.saturating_add(T::DbWeight::get().reads(1));
 				let mut cumulative_gas_used = U256::zero();
 
 				for transaction in block.transactions {

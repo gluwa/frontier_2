@@ -20,6 +20,7 @@
 use super::*;
 use crate::{Bloom, DigestItem, Encode, PreLog, FRONTIER_ENGINE_ID, H64};
 use frame_support::{traits::Hooks, weights::Weight};
+use frame_system::WeightInfo as _;
 
 // Gas used by a plain value transfer.
 const TRANSFER_GAS: u64 = 21_000;
@@ -90,6 +91,25 @@ fn pre_log_batch_within_block_gas_limit_works() {
 		assert_eq!(block.transactions.len(), 3);
 		assert_eq!(block.header.gas_used, U256::from(3 * TRANSFER_GAS));
 		assert!(block.header.gas_used <= block.header.gas_limit);
+	});
+}
+
+#[test]
+fn pre_log_weight_accounts_for_block_gas_limit_read() {
+	let (pairs, mut ext) = new_test_ext(2);
+	let alice = &pairs[0];
+	let bob = &pairs[1];
+
+	ext.execute_with(|| {
+		let weight = import_pre_log_block(alice, bob.address, 0);
+
+		let db_weight = <Test as frame_system::Config>::DbWeight::get();
+		let expected = <Test as frame_system::Config>::SystemWeightInfo::kill_storage(1)
+			// The block gas limit.
+			.saturating_add(db_weight.reads(1))
+			// `on_finalize`.
+			.saturating_add(db_weight.reads_writes(2, 2));
+		assert_eq!(weight, expected);
 	});
 }
 
