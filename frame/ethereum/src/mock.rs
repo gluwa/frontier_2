@@ -24,7 +24,11 @@ use ethereum::{
 };
 use rlp::RlpStream;
 // Substrate
-use frame_support::{derive_impl, parameter_types, traits::FindAuthor, ConsensusEngineId};
+use frame_support::{
+	derive_impl, parameter_types,
+	traits::{FindAuthor, Get},
+	ConsensusEngineId,
+};
 use sp_core::{hashing::keccak_256, H160, H256, U256};
 use sp_runtime::{
 	traits::{Dispatchable, IdentityLookup},
@@ -87,6 +91,35 @@ impl FindAuthor<H160> for FindAuthorTruncated {
 	}
 }
 
+const DEFAULT_BLOCK_GAS_LIMIT: u64 = 150_000_000;
+
+thread_local! {
+	static BLOCK_GAS_LIMIT: core::cell::Cell<u64> =
+		const { core::cell::Cell::new(DEFAULT_BLOCK_GAS_LIMIT) };
+}
+
+/// Restores the default block gas limit of the current test thread when dropped.
+pub struct BlockGasLimitGuard;
+
+impl Drop for BlockGasLimitGuard {
+	fn drop(&mut self) {
+		BLOCK_GAS_LIMIT.with(|l| l.set(DEFAULT_BLOCK_GAS_LIMIT));
+	}
+}
+
+/// Overrides the block gas limit of the current test thread until the guard is dropped.
+pub fn set_block_gas_limit(limit: u64) -> BlockGasLimitGuard {
+	BLOCK_GAS_LIMIT.with(|l| l.set(limit));
+	BlockGasLimitGuard
+}
+
+pub struct TestBlockGasLimit;
+impl Get<U256> for TestBlockGasLimit {
+	fn get() -> U256 {
+		U256::from(BLOCK_GAS_LIMIT.with(|l| l.get()))
+	}
+}
+
 parameter_types! {
 	pub const TransactionByteFee: u64 = 1;
 	pub const GasLimitStorageGrowthRatio: u64 = 0;
@@ -98,6 +131,7 @@ parameter_types! {
 #[derive_impl(pallet_evm::config_preludes::TestDefaultConfig)]
 impl pallet_evm::Config for Test {
 	type AccountProvider = pallet_evm::FrameSystemAccountProvider<Self>;
+	type BlockGasLimit = TestBlockGasLimit;
 	type BlockHashMapping = crate::EthereumBlockHashMapping<Self>;
 	type CreateOriginFilter = EnsureAllowedCreateAddress<AllowedAddressesCreate>;
 	type CreateInnerOriginFilter = EnsureAllowedCreateAddress<AllowedAddressesCreateInner>;
