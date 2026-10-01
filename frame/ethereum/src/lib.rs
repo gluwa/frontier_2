@@ -238,10 +238,13 @@ pub mod pallet {
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
 		fn on_finalize(n: BlockNumberFor<T>) {
+			let pre_log = fp_consensus::find_pre_log(&frame_system::Pallet::<T>::digest()).is_ok();
 			<Pallet<T>>::store_block(
-				match fp_consensus::find_pre_log(&frame_system::Pallet::<T>::digest()) {
-					Ok(_) => None,
-					Err(_) => Some(T::PostLogContent::get()),
+				pre_log,
+				if pre_log {
+					None
+				} else {
+					Some(T::PostLogContent::get())
 				},
 				U256::from(UniqueSaturatedInto::<u128>::unique_saturated_into(
 					frame_system::Pallet::<T>::block_number(),
@@ -268,11 +271,6 @@ pub mod pallet {
 			if let Ok(log) = fp_consensus::find_pre_log(&frame_system::Pallet::<T>::digest()) {
 				let PreLog::Block(block) = log;
 
-				// The block gas limit may be an adjustment algorithm backed by storage.
-				let block_gas_limit = T::BlockGasLimit::get();
-				weight = weight.saturating_add(T::DbWeight::get().reads(1));
-				let mut cumulative_gas_used = U256::zero();
-
 				for transaction in block.transactions {
 					let source = Self::recover_signer(&transaction).expect(
 						"pre-block transaction signature invalid; the block cannot be built",
@@ -281,21 +279,8 @@ pub mod pallet {
 					Self::validate_transaction_in_block(source, &transaction).expect(
 						"pre-block transaction verification failed; the block cannot be built",
 					);
-					let (r, info) = Self::apply_validated_transaction(source, transaction, None)
+					let (r, _) = Self::apply_validated_transaction(source, transaction, None)
 						.expect("pre-block apply transaction failed; the block cannot be built");
-
-					// Each transaction is only checked against the block gas limit on its own, so the
-					// cumulative gas, as accounted in the pending receipts, is bounded here. This keeps
-					// the stored block's `gas_used` within its `gas_limit`.
-					let used_gas = match info {
-						CallOrCreateInfo::Call(info) => info.used_gas.effective,
-						CallOrCreateInfo::Create(info) => info.used_gas.effective,
-					};
-					cumulative_gas_used = cumulative_gas_used.saturating_add(used_gas);
-					assert!(
-						cumulative_gas_used <= block_gas_limit,
-						"pre-block gas used exceeds the block gas limit; the block cannot be built",
-					);
 
 					weight = weight.saturating_add(r.actual_weight.unwrap_or_default());
 				}
@@ -400,7 +385,7 @@ pub mod pallet {
 	#[pallet::genesis_build]
 	impl<T: Config> BuildGenesisConfig for GenesisConfig<T> {
 		fn build(&self) {
-			<Pallet<T>>::store_block(None, U256::zero());
+			<Pallet<T>>::store_block(false, None, U256::zero());
 			frame_support::storage::unhashed::put::<EthereumStorageSchema>(
 				PALLET_ETHEREUM_SCHEMA,
 				&EthereumStorageSchema::V3,
@@ -464,7 +449,7 @@ impl<T: Config> Pallet<T> {
 		Some(H160::from(H256::from(sp_io::hashing::keccak_256(&pubkey))))
 	}
 
-	fn store_block(post_log: Option<PostLogContent>, block_number: U256) {
+	fn store_block(pre_log: bool, post_log: Option<PostLogContent>, block_number: U256) {
 		let transactions_count = Pending::<T>::count();
 		let mut transactions = Vec::with_capacity(transactions_count as usize);
 		let mut statuses = Vec::with_capacity(transactions_count as usize);
@@ -487,6 +472,15 @@ impl<T: Config> Pallet<T> {
 			}
 		}
 
+		// The transactions of a block imported through a `PreLog` are only checked against the block
+		// gas limit one by one. Bound their cumulative gas against the limit stored in the header,
+		// which is read here and may differ from the one in effect when they were applied.
+		let block_gas_limit = T::BlockGasLimit::get();
+		assert!(
+			!pre_log || cumulative_gas_used <= block_gas_limit,
+			"pre-block gas used exceeds the block gas limit; the block cannot be built",
+		);
+
 		let ommers = Vec::<ethereum::Header>::new();
 		let receipts_root = ethereum::util::ordered_trie_root(
 			receipts.iter().map(ethereum::EnvelopedEncodable::encode),
@@ -503,7 +497,7 @@ impl<T: Config> Pallet<T> {
 			logs_bloom,
 			difficulty: U256::zero(),
 			number: block_number,
-			gas_limit: T::BlockGasLimit::get(),
+			gas_limit: block_gas_limit,
 			gas_used: cumulative_gas_used,
 			timestamp: T::Timestamp::now().unique_saturated_into(),
 			extra_data: Vec::new(),

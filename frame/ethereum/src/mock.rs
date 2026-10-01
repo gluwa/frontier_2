@@ -27,7 +27,6 @@ use rlp::RlpStream;
 use frame_support::{
 	derive_impl, parameter_types,
 	traits::{FindAuthor, Get},
-	weights::RuntimeDbWeight,
 	ConsensusEngineId,
 };
 use sp_core::{hashing::keccak_256, H160, H256, U256};
@@ -54,10 +53,6 @@ frame_support::construct_runtime! {
 
 parameter_types! {
 	pub const BlockHashCount: u64 = 250;
-	pub const TestDbWeight: RuntimeDbWeight = RuntimeDbWeight {
-		read: 1_000,
-		write: 10_000,
-	};
 }
 
 #[derive_impl(frame_system::config_preludes::TestDefaultConfig as frame_system::DefaultConfig)]
@@ -66,7 +61,6 @@ impl frame_system::Config for Test {
 	type Lookup = IdentityLookup<Self::AccountId>;
 	type Block = frame_system::mocking::MockBlock<Self>;
 	type BlockHashCount = BlockHashCount;
-	type DbWeight = TestDbWeight;
 	type AccountData = pallet_balances::AccountData<u64>;
 }
 

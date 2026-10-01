@@ -20,7 +20,6 @@
 use super::*;
 use crate::{Bloom, DigestItem, Encode, PreLog, FRONTIER_ENGINE_ID, H64};
 use frame_support::{traits::Hooks, weights::Weight};
-use frame_system::WeightInfo as _;
 
 // Gas used by a plain value transfer.
 const TRANSFER_GAS: u64 = 21_000;
@@ -59,9 +58,9 @@ fn pre_log_block(transactions: Vec<Transaction>) -> ethereum::BlockV3 {
 	)
 }
 
-// Imports `count` transfers from `sender` as a `PreLog` block, returning the weight used on
-// initialization.
-fn import_pre_log_block(sender: &AccountInfo, recipient: H160, count: u64) -> Weight {
+// Starts a block that imports `count` transfers from `sender` as a `PreLog` block, returning the
+// weight used on initialization.
+fn initialize_pre_log_block(sender: &AccountInfo, recipient: H160, count: u64) -> Weight {
 	let transactions = (0..count)
 		.map(|nonce| transfer(sender, recipient, nonce))
 		.collect();
@@ -72,7 +71,13 @@ fn import_pre_log_block(sender: &AccountInfo, recipient: H160, count: u64) -> We
 		PreLog::Block(pre_log_block(transactions)).encode(),
 	));
 
-	let weight = Ethereum::on_initialize(1);
+	Ethereum::on_initialize(1)
+}
+
+// Imports `count` transfers from `sender` as a `PreLog` block, returning the weight used on
+// initialization.
+fn import_pre_log_block(sender: &AccountInfo, recipient: H160, count: u64) -> Weight {
+	let weight = initialize_pre_log_block(sender, recipient, count);
 	Ethereum::on_finalize(1);
 	weight
 }
@@ -91,25 +96,6 @@ fn pre_log_batch_within_block_gas_limit_works() {
 		assert_eq!(block.transactions.len(), 3);
 		assert_eq!(block.header.gas_used, U256::from(3 * TRANSFER_GAS));
 		assert!(block.header.gas_used <= block.header.gas_limit);
-	});
-}
-
-#[test]
-fn pre_log_weight_accounts_for_block_gas_limit_read() {
-	let (pairs, mut ext) = new_test_ext(2);
-	let alice = &pairs[0];
-	let bob = &pairs[1];
-
-	ext.execute_with(|| {
-		let weight = import_pre_log_block(alice, bob.address, 0);
-
-		let db_weight = <Test as frame_system::Config>::DbWeight::get();
-		let expected = <Test as frame_system::Config>::SystemWeightInfo::kill_storage(1)
-			// The block gas limit.
-			.saturating_add(db_weight.reads(1))
-			// `on_finalize`.
-			.saturating_add(db_weight.reads_writes(2, 2));
-		assert_eq!(weight, expected);
 	});
 }
 
@@ -155,5 +141,39 @@ fn pre_log_batch_over_block_gas_limit_fails() {
 	ext.execute_with(|| {
 		let _guard = set_block_gas_limit(2 * TRANSFER_GAS);
 		import_pre_log_block(alice, bob.address, 5);
+	});
+}
+
+#[test]
+#[should_panic(expected = "pre-block gas used exceeds the block gas limit")]
+fn pre_log_batch_over_block_gas_limit_lowered_before_finalize_fails() {
+	let (pairs, mut ext) = new_test_ext(2);
+	let alice = &pairs[0];
+	let bob = &pairs[1];
+
+	ext.execute_with(|| {
+		// The batch fits the limit when it is applied, but not the one stored in the header.
+		let _guard = set_block_gas_limit(3 * TRANSFER_GAS);
+		initialize_pre_log_block(alice, bob.address, 3);
+		let _guard = set_block_gas_limit(3 * TRANSFER_GAS - 1);
+		Ethereum::on_finalize(1);
+	});
+}
+
+#[test]
+fn pre_log_batch_is_bounded_by_block_gas_limit_of_header() {
+	let (pairs, mut ext) = new_test_ext(2);
+	let alice = &pairs[0];
+	let bob = &pairs[1];
+
+	ext.execute_with(|| {
+		let _guard = set_block_gas_limit(2 * TRANSFER_GAS);
+		initialize_pre_log_block(alice, bob.address, 3);
+		let _guard = set_block_gas_limit(3 * TRANSFER_GAS);
+		Ethereum::on_finalize(1);
+
+		let block = crate::CurrentBlock::<Test>::get().expect("block is stored");
+		assert_eq!(block.header.gas_limit, U256::from(3 * TRANSFER_GAS));
+		assert_eq!(block.header.gas_used, block.header.gas_limit);
 	});
 }
