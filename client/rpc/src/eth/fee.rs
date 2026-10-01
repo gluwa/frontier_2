@@ -419,7 +419,7 @@ mod precision_tests {
 			assert_eq!(scale_base_fee(base_fee, 0.75), base_fee * 3 / 4);
 			assert_eq!(scale_base_fee(base_fee, 0.125), base_fee / 8);
 			assert_eq!(scale_base_fee(base_fee, 2.0), base_fee * 2);
-			// Factors below `1e-18` are not rounded to a multiple of it.
+			// A factor that is not a multiple of `1e-18` is not rounded to one.
 			assert_eq!(scale_base_fee(base_fee, 2f64.powi(-55)), base_fee >> 55);
 			// 0.1 is 3602879701896397 / 2^55 as an `f64`.
 			assert_eq!(
