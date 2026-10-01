@@ -121,7 +121,8 @@ pub mod frontier_backend_client {
 			Ok(None) if balance.is_some() || nonce.is_some() => {
 				let mut item = default_account_info();
 				// A funded account is kept alive by a provider reference, as it would be on chain.
-				if balance.is_some_and(|balance| !balance.is_zero()) {
+				// Judge it by the balance that is actually stored, which `low_u128` truncates.
+				if balance.is_some_and(|balance| balance.low_u128() != 0) {
 					item.splice(ACCOUNT_PROVIDERS, 1u32.encode());
 				}
 				item
@@ -630,7 +631,7 @@ mod tests {
 		fn overridden_account<O: RuntimeStorageOverride<TestBlock, TestClient>>(
 			client: &TestClient,
 			block: Hash,
-			balance: Option<u128>,
+			balance: Option<U256>,
 			nonce: Option<u32>,
 		) -> Option<AccountInfo> {
 			let mut overlay = OverlayedChanges::<HashingFor<TestBlock>>::default();
@@ -640,7 +641,7 @@ mod tests {
 				block,
 				6,
 				ADDRESS,
-				balance.map(U256::from),
+				balance,
 				nonce.map(U256::from),
 			);
 			let key = account_key(&O::into_account_id_bytes(ADDRESS));
@@ -664,12 +665,12 @@ mod tests {
 
 			// Balance and nonce: a funded account is kept alive by a provider reference.
 			assert_eq!(
-				overridden_account::<O>(&client, best, Some(1_000), Some(7)),
+				overridden_account::<O>(&client, best, Some(U256::from(1_000)), Some(7)),
 				Some((7, 0, 1, 0, 1_000, 0, 0, IS_NEW_LOGIC)),
 			);
 			// Balance only.
 			assert_eq!(
-				overridden_account::<O>(&client, best, Some(1_000), None),
+				overridden_account::<O>(&client, best, Some(U256::from(1_000)), None),
 				Some((0, 0, 1, 0, 1_000, 0, 0, IS_NEW_LOGIC)),
 			);
 			// Nonce only.
@@ -679,7 +680,12 @@ mod tests {
 			);
 			// A zero balance does not fund the account.
 			assert_eq!(
-				overridden_account::<O>(&client, best, Some(0), None),
+				overridden_account::<O>(&client, best, Some(U256::zero()), None),
+				Some((0, 0, 0, 0, 0, 0, 0, IS_NEW_LOGIC)),
+			);
+			// A balance that truncates to zero does not fund the account either.
+			assert_eq!(
+				overridden_account::<O>(&client, best, Some(U256::one() << 128), None),
 				Some((0, 0, 0, 0, 0, 0, 0, IS_NEW_LOGIC)),
 			);
 			// Nothing to override: no account is conjured up (e.g. a code-only override).
@@ -694,11 +700,11 @@ mod tests {
 
 			// Only the overridden fields change; the rest of the record is retained.
 			assert_eq!(
-				overridden_account::<O>(&client, block, Some(1_000), Some(7)),
+				overridden_account::<O>(&client, block, Some(U256::from(1_000)), Some(7)),
 				Some((7, 4, 5, 6, 1_000, 200, 300, IS_NEW_LOGIC)),
 			);
 			assert_eq!(
-				overridden_account::<O>(&client, block, Some(1_000), None),
+				overridden_account::<O>(&client, block, Some(U256::from(1_000)), None),
 				Some((3, 4, 5, 6, 1_000, 200, 300, IS_NEW_LOGIC)),
 			);
 			assert_eq!(
