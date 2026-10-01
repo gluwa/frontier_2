@@ -19,7 +19,7 @@
 mod block;
 mod client;
 mod execute;
-mod fee;
+pub(crate) mod fee;
 pub(crate) mod filter;
 pub mod format;
 mod mining;
@@ -238,10 +238,7 @@ where
 			.await;
 		let receipts = self.storage_override.current_receipts(substrate_hash);
 		let is_eip1559 = self.storage_override.is_eip1559(substrate_hash);
-		let base_fee = self
-			.client
-			.runtime_api()
-			.gas_price(substrate_hash)
+		let base_fee = fee::execution_base_fee::<B, C>(self.client.as_ref(), substrate_hash)
 			.unwrap_or_default();
 
 		Ok(BlockInfo::new(
@@ -627,6 +624,18 @@ fn rich_block_build(
 	}
 }
 
+/// Effective gas price of an EIP-1559 style transaction included in a block executed with `base_fee`.
+fn eip1559_effective_gas_price(
+	base_fee: U256,
+	max_priority_fee_per_gas: U256,
+	max_fee_per_gas: U256,
+) -> U256 {
+	base_fee
+		.checked_add(max_priority_fee_per_gas)
+		.unwrap_or_else(U256::max_value)
+		.min(max_fee_per_gas)
+}
+
 fn transaction_build(
 	ethereum_transaction: &EthereumTransaction,
 	block: Option<&EthereumBlock>,
@@ -654,12 +663,11 @@ fn transaction_build(
 			let max_priority_fee_per_gas = transaction.max_priority_fee_per_gas.unwrap_or_default();
 			let max_fee_per_gas = transaction.max_fee_per_gas.unwrap_or_default();
 			// If transaction is already mined, gas price is the effective gas price.
-			transaction.gas_price = Some(
-				base_fee
-					.checked_add(max_priority_fee_per_gas)
-					.unwrap_or_else(U256::max_value)
-					.min(max_fee_per_gas),
-			);
+			transaction.gas_price = Some(eip1559_effective_gas_price(
+				base_fee,
+				max_priority_fee_per_gas,
+				max_fee_per_gas,
+			));
 		}
 	}
 
