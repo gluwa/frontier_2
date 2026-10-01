@@ -66,6 +66,37 @@ describeWithFrontierWs("Frontier RPC (newHeads Compliance)", (context) => {
 		expect(data.parentHash).to.match(/^0x[0-9a-fA-F]{64}$/);
 	}).timeout(40000);
 
+	step("newHeads timestamp should match eth_getBlockByNumber and eth_getBlockByHash", async function () {
+		subscription = context.web3.eth.subscribe("newBlockHeaders", function (error, result) {});
+
+		let data = null;
+		let dataResolve = null;
+		let dataPromise = new Promise((resolve) => {
+			dataResolve = resolve;
+		});
+
+		subscription.on("data", function (d: any) {
+			data = d;
+			subscription.unsubscribe();
+			dataResolve();
+		});
+
+		await createBlock();
+		await dataPromise;
+
+		const byNumber = await customRequest(context.web3, "eth_getBlockByNumber", [
+			context.web3.utils.toHex(data.number),
+			false,
+		]);
+		const byHash = await customRequest(context.web3, "eth_getBlockByHash", [data.hash, false]);
+
+		// Both fetched views and the subscription must report the same value, in seconds
+		// as required by the Ethereum JSON-RPC (not milliseconds).
+		const fetchedTimestamp = context.web3.utils.hexToNumber(byNumber.result.timestamp);
+		expect(context.web3.utils.hexToNumber(byHash.result.timestamp)).to.equal(fetchedTimestamp);
+		expect(data.timestamp).to.equal(fetchedTimestamp);
+	}).timeout(40000);
+
 	step("newHeads should emit headers in order for normal block production", async function () {
 		subscription = context.web3.eth.subscribe("newBlockHeaders", function (error, result) {});
 
