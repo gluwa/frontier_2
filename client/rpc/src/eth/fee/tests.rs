@@ -316,7 +316,8 @@ fn next_block_base_fee_estimate_follows_the_gas_used_ratio() {
 	assert_eq!(estimate(1_000, 0.5), U256::from(1_000));
 	// Below target: decreases, down by elasticity when the block is empty.
 	assert_eq!(estimate(1_000, 0.0), U256::from(875));
-	assert_eq!(estimate(1_000, 0.25), U256::from(937));
+	// The runtime rounds the decrease down (62.5 to 62), so the fee rounds up.
+	assert_eq!(estimate(1_000, 0.25), U256::from(938));
 	// Without elasticity the fee is constant.
 	assert_eq!(
 		estimate_next_base_fee(U256::from(1_000), 1.0, Permill::zero()),
@@ -484,7 +485,7 @@ fn block_transaction_and_fee_history_agree_on_the_execution_base_fee() {
 			build_fee_history_cache_item(Some(block.clone()), Some(receipts), base_fee);
 		assert_eq!(cache_number, Some(number as u64));
 		assert_eq!(
-			U256::from(cache_item.base_fee),
+			cache_item.base_fee,
 			rich_block.inner.base_fee_per_gas.unwrap()
 		);
 
@@ -624,11 +625,11 @@ fn fee_history_rewards_depend_on_the_base_fee_used() {
 	let (adjusted, _) =
 		build_fee_history_cache_item(Some(block), Some(receipts), U256::from(1_125));
 
-	assert_eq!(executed.base_fee, 1_000);
+	assert_eq!(executed.base_fee, U256::from(1_000));
 	assert_eq!(executed.rewards[0], 0);
 	assert_eq!(executed.rewards[150], 50);
 	assert_eq!(executed.rewards[200], 130);
-	assert_eq!(adjusted.base_fee, 1_125);
+	assert_eq!(adjusted.base_fee, U256::from(1_125));
 	assert_eq!(adjusted.rewards[0], 0);
 	assert_eq!(adjusted.rewards[150], 5);
 	assert_eq!(adjusted.rewards[200], 7);
@@ -640,7 +641,7 @@ fn fee_history_rewards_depend_on_the_base_fee_used() {
 fn fee_history_entry_without_block_data_has_zero_rewards() {
 	let (cache_item, cache_number) = build_fee_history_cache_item(None, None, U256::from(1_000));
 	assert_eq!(cache_number, None);
-	assert_eq!(cache_item.base_fee, 1_000);
+	assert_eq!(cache_item.base_fee, U256::from(1_000));
 	assert_eq!(cache_item.gas_used_ratio, 0f64);
 	assert_eq!(cache_item.rewards, vec![0; 201]);
 }

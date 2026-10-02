@@ -48,7 +48,7 @@ pub type FeeHistoryCache = Arc<Mutex<BTreeMap<u64, FeeHistoryCacheItem>>>;
 pub type FeeHistoryCacheLimit = u64;
 
 pub struct FeeHistoryCacheItem {
-	pub base_fee: u64,
+	pub base_fee: U256,
 	pub gas_used_ratio: f64,
 	pub rewards: Vec<u64>,
 }

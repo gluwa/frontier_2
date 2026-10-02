@@ -373,7 +373,7 @@ pub(crate) fn build_fee_history_cache_item(
 
 	let mut block_number: Option<u64> = None;
 	let mut result = FeeHistoryCacheItem {
-		base_fee: UniqueSaturatedInto::<u64>::unique_saturated_into(base_fee),
+		base_fee,
 		gas_used_ratio: 0f64,
 		rewards: Vec::new(),
 	};
