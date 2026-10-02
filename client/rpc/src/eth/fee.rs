@@ -124,14 +124,19 @@ where
 			if lowest < best_number.saturating_sub(self.fee_history_cache_limit) {
 				return Err(internal_err("Block range out of bounds."));
 			}
-			if let Ok(fee_history_cache) = &self.fee_history_cache.lock() {
-				let mut response = FeeHistory {
-					oldest_block: U256::from(lowest),
-					base_fee_per_gas: Vec::new(),
-					gas_used_ratio: Vec::new(),
-					reward: None,
+			let mut response = FeeHistory {
+				oldest_block: U256::from(lowest),
+				base_fee_per_gas: Vec::new(),
+				gas_used_ratio: Vec::new(),
+				reward: None,
+			};
+			let mut rewards = Vec::new();
+			// Everything needed is copied out of the cache while holding the lock, which is released
+			// before querying the runtime below.
+			{
+				let Ok(fee_history_cache) = self.fee_history_cache.lock() else {
+					return Err(internal_err("Failed to read fee history cache."));
 				};
-				let mut rewards = Vec::new();
 				// Iterate over the requested block range.
 				for n in lowest..highest + 1 {
 					if let Some(block) = fee_history_cache.get(&n) {
@@ -163,39 +168,37 @@ where
 						}
 					}
 				}
-				if rewards.len() > 0 {
-					response.reward = Some(rewards);
-				}
-				// Calculate next base fee.
-				if let (Some(last_gas_used), Some(last_fee_per_gas)) = (
-					response.gas_used_ratio.last(),
-					response.base_fee_per_gas.last(),
-				) {
-					let substrate_hash = self
-						.client
-						.expect_block_hash_from_id(&id)
-						.map_err(|_| internal_err(format!("Expect block number from id: {id}")))?;
-					// The cached entries hold the fee each block was executed with, so the fee of the
-					// block following the newest one is not among them. It is the value the runtime
-					// holds once the newest block has been finalized, which is what `gas_price`
-					// reports at that block.
-					let next_base_fee = match self.client.runtime_api().gas_price(substrate_hash) {
-						Ok(next_base_fee) => next_base_fee,
-						// Estimate when the runtime cannot be queried, e.g. for pruned state.
-						Err(_) => {
-							let elasticity = self
-								.storage_override
-								.elasticity(substrate_hash)
-								.unwrap_or(Permill::from_parts(125_000));
-							estimate_next_base_fee(*last_fee_per_gas, *last_gas_used, elasticity)
-						}
-					};
-					response.base_fee_per_gas.push(next_base_fee);
-				}
-				return Ok(response);
-			} else {
-				return Err(internal_err("Failed to read fee history cache."));
 			}
+			if rewards.len() > 0 {
+				response.reward = Some(rewards);
+			}
+			// Calculate next base fee.
+			if let (Some(last_gas_used), Some(last_fee_per_gas)) = (
+				response.gas_used_ratio.last(),
+				response.base_fee_per_gas.last(),
+			) {
+				let substrate_hash = self
+					.client
+					.expect_block_hash_from_id(&id)
+					.map_err(|_| internal_err(format!("Expect block number from id: {id}")))?;
+				// The cached entries hold the fee each block was executed with, so the fee of the
+				// block following the newest one is not among them. It is the value the runtime
+				// holds once the newest block has been finalized, which is what `gas_price`
+				// reports at that block.
+				let next_base_fee = match self.client.runtime_api().gas_price(substrate_hash) {
+					Ok(next_base_fee) => next_base_fee,
+					// Estimate when the runtime cannot be queried, e.g. for pruned state.
+					Err(_) => {
+						let elasticity = self
+							.storage_override
+							.elasticity(substrate_hash)
+							.unwrap_or(Permill::from_parts(125_000));
+						estimate_next_base_fee(*last_fee_per_gas, *last_gas_used, elasticity)
+					}
+				};
+				response.base_fee_per_gas.push(next_base_fee);
+			}
+			return Ok(response);
 		}
 		Err(internal_err(format!(
 			"Failed to retrieve requested block {newest_block:?}."
