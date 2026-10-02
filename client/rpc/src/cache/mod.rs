@@ -43,6 +43,7 @@ use fc_storage::StorageOverride;
 use fp_rpc::{EthereumRuntimeRPCApi, TransactionStatus};
 
 use self::lru_cache::LRUCacheByteLimited;
+use crate::eth::fee::execution_base_fee;
 
 type WaitList<Hash, T> = HashMap<Hash, Vec<oneshot::Sender<Option<T>>>>;
 
@@ -282,103 +283,13 @@ where
 		fee_history_cache: FeeHistoryCache,
 		block_limit: u64,
 	) {
-		struct TransactionHelper {
-			gas_used: u64,
-			effective_reward: u64,
-		}
 		// Calculates the cache for a single block
-		#[rustfmt::skip]
-			let fee_history_cache_item = |hash: B::Hash| -> (
-			FeeHistoryCacheItem,
-			Option<u64>
-		) {
-			// Evenly spaced percentile list from 0.0 to 100.0 with a 0.5 resolution.
-			// This means we cache 200 percentile points.
-			// Later in request handling we will approximate by rounding percentiles that
-			// fall in between with `(round(n*2)/2)`.
-			let reward_percentiles: Vec<f64> = {
-				let mut percentile: f64 = 0.0;
-				(0..201)
-					.map(|_| {
-						let val = percentile;
-						percentile += 0.5;
-						val
-					})
-					.collect()
-			};
-
+		let fee_history_cache_item = |hash: B::Hash| -> (FeeHistoryCacheItem, Option<u64>) {
 			let block = storage_override.current_block(hash);
-			let mut block_number: Option<u64> = None;
-			let base_fee = client.runtime_api().gas_price(hash).unwrap_or_default();
 			let receipts = storage_override.current_receipts(hash);
-			let mut result = FeeHistoryCacheItem {
-				base_fee: UniqueSaturatedInto::<u64>::unique_saturated_into(base_fee),
-				gas_used_ratio: 0f64,
-				rewards: Vec::new(),
-			};
-			if let (Some(block), Some(receipts)) = (block, receipts) {
-				block_number = Some(UniqueSaturatedInto::<u64>::unique_saturated_into(block.header.number));
-				let gas_used = UniqueSaturatedInto::<u64>::unique_saturated_into(block.header.gas_used) as f64;
-				let gas_limit = UniqueSaturatedInto::<u64>::unique_saturated_into(block.header.gas_limit) as f64;
-				result.gas_used_ratio = gas_used / gas_limit;
-
-				let mut previous_cumulative_gas = U256::zero();
-				let used_gas = |current: U256, previous: &mut U256| -> u64 {
-					let r = UniqueSaturatedInto::<u64>::unique_saturated_into(current.saturating_sub(*previous));
-					*previous = current;
-					r
-				};
-				// Build a list of relevant transaction information.
-				let mut transactions: Vec<TransactionHelper> = receipts
-					.iter()
-					.enumerate()
-					.map(|(i, receipt)| TransactionHelper {
-						gas_used: match receipt {
-							ethereum::ReceiptV4::Legacy(d) | ethereum::ReceiptV4::EIP2930(d) | ethereum::ReceiptV4::EIP1559(d) | ethereum::ReceiptV4::EIP7702(d) => used_gas(d.used_gas, &mut previous_cumulative_gas),
-						},
-						effective_reward: match block.transactions.get(i) {
-							Some(ethereum::TransactionV3::Legacy(t)) => {
-								UniqueSaturatedInto::<u64>::unique_saturated_into(t.gas_price.saturating_sub(base_fee))
-							}
-							Some(ethereum::TransactionV3::EIP2930(t)) => {
-								UniqueSaturatedInto::<u64>::unique_saturated_into(t.gas_price.saturating_sub(base_fee))
-							}
-							Some(ethereum::TransactionV3::EIP1559(t)) => UniqueSaturatedInto::<u64>::unique_saturated_into(
-									t
-										.max_priority_fee_per_gas
-										.min(t.max_fee_per_gas.saturating_sub(base_fee))
-							),
-							Some(ethereum::TransactionV3::EIP7702(t)) => UniqueSaturatedInto::<u64>::unique_saturated_into(
-									t
-										.max_priority_fee_per_gas
-										.min(t.max_fee_per_gas.saturating_sub(base_fee))
-							),
-							None => 0,
-						},
-					})
-					.collect();
-				// Sort ASC by effective reward.
-				transactions.sort_by(|a, b| a.effective_reward.cmp(&b.effective_reward));
-
-				// Calculate percentile rewards.
-				result.rewards = reward_percentiles
-					.into_iter()
-					.filter_map(|p| {
-						let target_gas = (p * gas_used / 100f64) as u64;
-						let mut sum_gas = 0;
-						for tx in &transactions {
-							sum_gas += tx.gas_used;
-							if target_gas <= sum_gas {
-								return Some(tx.effective_reward);
-							}
-						}
-						None
-					})
-					.collect();
-			} else {
-				result.rewards = reward_percentiles.iter().map(|_| 0).collect();
-			}
-			(result, block_number)
+			// The fee the block was executed with, which is the one its parent left behind.
+			let base_fee = execution_base_fee::<B, C>(client.as_ref(), hash).unwrap_or_default();
+			build_fee_history_cache_item(block, receipts, base_fee)
 		};
 
 		// Commits the result to cache
@@ -429,4 +340,119 @@ where
 			}
 		}
 	}
+}
+
+/// Builds the fee history cache entry of a block, along with the block number when known.
+///
+/// `base_fee` must be the fee the block was executed with: it decides how much of each
+/// transaction's fee is a reward on top of the base fee.
+pub(crate) fn build_fee_history_cache_item(
+	block: Option<EthereumBlock>,
+	receipts: Option<Vec<ethereum::ReceiptV4>>,
+	base_fee: U256,
+) -> (FeeHistoryCacheItem, Option<u64>) {
+	struct TransactionHelper {
+		gas_used: u64,
+		effective_reward: u64,
+	}
+
+	// Evenly spaced percentile list from 0.0 to 100.0 with a 0.5 resolution.
+	// This means we cache 200 percentile points.
+	// Later in request handling we will approximate by rounding percentiles that
+	// fall in between with `(round(n*2)/2)`.
+	let reward_percentiles: Vec<f64> = {
+		let mut percentile: f64 = 0.0;
+		(0..201)
+			.map(|_| {
+				let val = percentile;
+				percentile += 0.5;
+				val
+			})
+			.collect()
+	};
+
+	let mut block_number: Option<u64> = None;
+	let mut result = FeeHistoryCacheItem {
+		base_fee: UniqueSaturatedInto::<u64>::unique_saturated_into(base_fee),
+		gas_used_ratio: 0f64,
+		rewards: Vec::new(),
+	};
+	if let (Some(block), Some(receipts)) = (block, receipts) {
+		block_number = Some(UniqueSaturatedInto::<u64>::unique_saturated_into(
+			block.header.number,
+		));
+		let gas_used =
+			UniqueSaturatedInto::<u64>::unique_saturated_into(block.header.gas_used) as f64;
+		let gas_limit =
+			UniqueSaturatedInto::<u64>::unique_saturated_into(block.header.gas_limit) as f64;
+		result.gas_used_ratio = gas_used / gas_limit;
+
+		let mut previous_cumulative_gas = U256::zero();
+		let used_gas = |current: U256, previous: &mut U256| -> u64 {
+			let r = UniqueSaturatedInto::<u64>::unique_saturated_into(
+				current.saturating_sub(*previous),
+			);
+			*previous = current;
+			r
+		};
+		// Build a list of relevant transaction information.
+		let mut transactions: Vec<TransactionHelper> = receipts
+			.iter()
+			.enumerate()
+			.map(|(i, receipt)| TransactionHelper {
+				gas_used: match receipt {
+					ethereum::ReceiptV4::Legacy(d)
+					| ethereum::ReceiptV4::EIP2930(d)
+					| ethereum::ReceiptV4::EIP1559(d)
+					| ethereum::ReceiptV4::EIP7702(d) => used_gas(d.used_gas, &mut previous_cumulative_gas),
+				},
+				effective_reward: match block.transactions.get(i) {
+					Some(ethereum::TransactionV3::Legacy(t)) => {
+						UniqueSaturatedInto::<u64>::unique_saturated_into(
+							t.gas_price.saturating_sub(base_fee),
+						)
+					}
+					Some(ethereum::TransactionV3::EIP2930(t)) => {
+						UniqueSaturatedInto::<u64>::unique_saturated_into(
+							t.gas_price.saturating_sub(base_fee),
+						)
+					}
+					Some(ethereum::TransactionV3::EIP1559(t)) => {
+						UniqueSaturatedInto::<u64>::unique_saturated_into(
+							t.max_priority_fee_per_gas
+								.min(t.max_fee_per_gas.saturating_sub(base_fee)),
+						)
+					}
+					Some(ethereum::TransactionV3::EIP7702(t)) => {
+						UniqueSaturatedInto::<u64>::unique_saturated_into(
+							t.max_priority_fee_per_gas
+								.min(t.max_fee_per_gas.saturating_sub(base_fee)),
+						)
+					}
+					None => 0,
+				},
+			})
+			.collect();
+		// Sort ASC by effective reward.
+		transactions.sort_by(|a, b| a.effective_reward.cmp(&b.effective_reward));
+
+		// Calculate percentile rewards.
+		result.rewards = reward_percentiles
+			.into_iter()
+			.filter_map(|p| {
+				let target_gas = (p * gas_used / 100f64) as u64;
+				let mut sum_gas = 0;
+				for tx in &transactions {
+					sum_gas += tx.gas_used;
+					if target_gas <= sum_gas {
+						return Some(tx.effective_reward);
+					}
+				}
+				None
+			})
+			.collect();
+	} else {
+		result.rewards = reward_percentiles.iter().map(|_| 0).collect();
+	}
+	(result, block_number)
 }

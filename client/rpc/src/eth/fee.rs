@@ -23,7 +23,7 @@ use sc_client_api::backend::{Backend, StorageProvider};
 use sp_api::ProvideRuntimeApi;
 use sp_blockchain::HeaderBackend;
 use sp_runtime::{
-	traits::{Block as BlockT, UniqueSaturatedInto},
+	traits::{Block as BlockT, Header as HeaderT, UniqueSaturatedInto, Zero},
 	Permill,
 };
 // Frontier
@@ -31,6 +31,49 @@ use fc_rpc_core::types::*;
 use fp_rpc::EthereumRuntimeRPCApi;
 
 use crate::{eth::Eth, frontier_backend_client, internal_err};
+
+/// Returns the base fee the transactions of block `hash` were executed with.
+///
+/// The base fee is adjusted when a block is finalized, after its transactions have run. The
+/// runtime's `gas_price` at `hash` therefore already holds the fee of the following block, while the
+/// fee that governed `hash` is the one its parent left behind. The genesis block has no parent, so
+/// its own (initial) value is used.
+pub(crate) fn execution_base_fee<B, C>(client: &C, hash: B::Hash) -> Option<U256>
+where
+	B: BlockT,
+	C: ProvideRuntimeApi<B> + HeaderBackend<B>,
+	C::Api: EthereumRuntimeRPCApi<B>,
+{
+	let header = client.header(hash).ok().flatten()?;
+	let fee_hash = if header.number().is_zero() {
+		hash
+	} else {
+		*header.parent_hash()
+	};
+	client.runtime_api().gas_price(fee_hash).ok()
+}
+
+/// Estimates the base fee following a block from its base fee and gas used ratio.
+///
+/// Only an approximation of the runtime's adjustment, which is driven by the block weight.
+fn estimate_next_base_fee(last_fee_per_gas: U256, last_gas_used: f64, elasticity: Permill) -> U256 {
+	let elasticity = elasticity.deconstruct() as f64 / 1_000_000f64;
+	let last_fee_per_gas =
+		UniqueSaturatedInto::<u64>::unique_saturated_into(last_fee_per_gas) as f64;
+	let new_base_fee = if last_gas_used > 0.5 {
+		// Increase base gas
+		let increase = ((last_gas_used - 0.5) * 2f64) * elasticity;
+		(last_fee_per_gas + (last_fee_per_gas * increase)) as u64
+	} else if last_gas_used < 0.5 {
+		// Decrease base gas
+		let decrease = ((0.5 - last_gas_used) * 2f64) * elasticity;
+		(last_fee_per_gas - (last_fee_per_gas * decrease)) as u64
+	} else {
+		// Same base gas
+		last_fee_per_gas as u64
+	};
+	U256::from(new_base_fee)
+}
 
 impl<B, C, P, CT, BE, CIDP, EC> Eth<B, C, P, CT, BE, CIDP, EC>
 where
@@ -81,14 +124,19 @@ where
 			if lowest < best_number.saturating_sub(self.fee_history_cache_limit) {
 				return Err(internal_err("Block range out of bounds."));
 			}
-			if let Ok(fee_history_cache) = &self.fee_history_cache.lock() {
-				let mut response = FeeHistory {
-					oldest_block: U256::from(lowest),
-					base_fee_per_gas: Vec::new(),
-					gas_used_ratio: Vec::new(),
-					reward: None,
+			let mut response = FeeHistory {
+				oldest_block: U256::from(lowest),
+				base_fee_per_gas: Vec::new(),
+				gas_used_ratio: Vec::new(),
+				reward: None,
+			};
+			let mut rewards = Vec::new();
+			// Everything needed is copied out of the cache while holding the lock, which is released
+			// before querying the runtime below.
+			{
+				let Ok(fee_history_cache) = self.fee_history_cache.lock() else {
+					return Err(internal_err("Failed to read fee history cache."));
 				};
-				let mut rewards = Vec::new();
 				// Iterate over the requested block range.
 				for n in lowest..highest + 1 {
 					if let Some(block) = fee_history_cache.get(&n) {
@@ -120,49 +168,37 @@ where
 						}
 					}
 				}
-				if rewards.len() > 0 {
-					response.reward = Some(rewards);
-				}
-				// Calculate next base fee.
-				if let (Some(last_gas_used), Some(last_fee_per_gas)) = (
-					response.gas_used_ratio.last(),
-					response.base_fee_per_gas.last(),
-				) {
-					let substrate_hash = self
-						.client
-						.expect_block_hash_from_id(&id)
-						.map_err(|_| internal_err(format!("Expect block number from id: {id}")))?;
-					let elasticity = self
-						.storage_override
-						.elasticity(substrate_hash)
-						.unwrap_or(Permill::from_parts(125_000))
-						.deconstruct();
-					let elasticity = elasticity as f64 / 1_000_000f64;
-					let last_fee_per_gas =
-						UniqueSaturatedInto::<u64>::unique_saturated_into(*last_fee_per_gas) as f64;
-					if last_gas_used > &0.5 {
-						// Increase base gas
-						let increase = ((last_gas_used - 0.5) * 2f64) * elasticity;
-						let new_base_fee =
-							(last_fee_per_gas + (last_fee_per_gas * increase)) as u64;
-						response.base_fee_per_gas.push(U256::from(new_base_fee));
-					} else if last_gas_used < &0.5 {
-						// Decrease base gas
-						let increase = ((0.5 - last_gas_used) * 2f64) * elasticity;
-						let new_base_fee =
-							(last_fee_per_gas - (last_fee_per_gas * increase)) as u64;
-						response.base_fee_per_gas.push(U256::from(new_base_fee));
-					} else {
-						// Same base gas
-						response
-							.base_fee_per_gas
-							.push(U256::from(last_fee_per_gas as u64));
-					}
-				}
-				return Ok(response);
-			} else {
-				return Err(internal_err("Failed to read fee history cache."));
 			}
+			if rewards.len() > 0 {
+				response.reward = Some(rewards);
+			}
+			// Calculate next base fee.
+			if let (Some(last_gas_used), Some(last_fee_per_gas)) = (
+				response.gas_used_ratio.last(),
+				response.base_fee_per_gas.last(),
+			) {
+				let substrate_hash = self
+					.client
+					.expect_block_hash_from_id(&id)
+					.map_err(|_| internal_err(format!("Expect block number from id: {id}")))?;
+				// The cached entries hold the fee each block was executed with, so the fee of the
+				// block following the newest one is not among them. It is the value the runtime
+				// holds once the newest block has been finalized, which is what `gas_price`
+				// reports at that block.
+				let next_base_fee = match self.client.runtime_api().gas_price(substrate_hash) {
+					Ok(next_base_fee) => next_base_fee,
+					// Estimate when the runtime cannot be queried, e.g. for pruned state.
+					Err(_) => {
+						let elasticity = self
+							.storage_override
+							.elasticity(substrate_hash)
+							.unwrap_or(Permill::from_parts(125_000));
+						estimate_next_base_fee(*last_fee_per_gas, *last_gas_used, elasticity)
+					}
+				};
+				response.base_fee_per_gas.push(next_base_fee);
+			}
+			return Ok(response);
 		}
 		Err(internal_err(format!(
 			"Failed to retrieve requested block {newest_block:?}."
@@ -198,3 +234,6 @@ where
 		Ok(*rewards.iter().min().unwrap_or(&U256::zero()))
 	}
 }
+
+#[cfg(test)]
+mod tests;

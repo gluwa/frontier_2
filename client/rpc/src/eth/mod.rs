@@ -19,7 +19,7 @@
 mod block;
 mod client;
 mod execute;
-mod fee;
+pub(crate) mod fee;
 pub(crate) mod filter;
 pub mod format;
 mod mining;
@@ -238,11 +238,7 @@ where
 			.await;
 		let receipts = self.storage_override.current_receipts(substrate_hash);
 		let is_eip1559 = self.storage_override.is_eip1559(substrate_hash);
-		let base_fee = self
-			.client
-			.runtime_api()
-			.gas_price(substrate_hash)
-			.unwrap_or_default();
+		let base_fee = fee::execution_base_fee::<B, C>(self.client.as_ref(), substrate_hash);
 
 		Ok(BlockInfo::new(
 			block,
@@ -627,6 +623,18 @@ fn rich_block_build(
 	}
 }
 
+/// Effective gas price of an EIP-1559 style transaction included in a block executed with `base_fee`.
+fn eip1559_effective_gas_price(
+	base_fee: U256,
+	max_priority_fee_per_gas: U256,
+	max_fee_per_gas: U256,
+) -> U256 {
+	base_fee
+		.checked_add(max_priority_fee_per_gas)
+		.unwrap_or_else(U256::max_value)
+		.min(max_fee_per_gas)
+}
+
 fn transaction_build(
 	ethereum_transaction: &EthereumTransaction,
 	block: Option<&EthereumBlock>,
@@ -646,7 +654,9 @@ fn transaction_build(
 
 	let mut transaction: Transaction = Transaction::build_from(from, ethereum_transaction);
 
-	if let EthereumTransaction::EIP1559(_) = ethereum_transaction {
+	// EIP-1559 and EIP-7702 transactions share the same fee market rules.
+	if let EthereumTransaction::EIP1559(_) | EthereumTransaction::EIP7702(_) = ethereum_transaction
+	{
 		if block.is_none() && status.is_none() {
 			// If transaction is not mined yet, gas price is considered just max fee per gas.
 		} else {
@@ -654,12 +664,11 @@ fn transaction_build(
 			let max_priority_fee_per_gas = transaction.max_priority_fee_per_gas.unwrap_or_default();
 			let max_fee_per_gas = transaction.max_fee_per_gas.unwrap_or_default();
 			// If transaction is already mined, gas price is the effective gas price.
-			transaction.gas_price = Some(
-				base_fee
-					.checked_add(max_priority_fee_per_gas)
-					.unwrap_or_else(U256::max_value)
-					.min(max_fee_per_gas),
-			);
+			transaction.gas_price = Some(eip1559_effective_gas_price(
+				base_fee,
+				max_priority_fee_per_gas,
+				max_fee_per_gas,
+			));
 		}
 	}
 
@@ -687,7 +696,9 @@ pub struct BlockInfo<H> {
 	statuses: Option<Vec<TransactionStatus>>,
 	substrate_hash: H,
 	is_eip1559: bool,
-	base_fee: U256,
+	/// The base fee the block was executed with, `None` when it cannot be determined (e.g. the
+	/// state of the parent block is pruned).
+	base_fee: Option<U256>,
 }
 
 impl<H> BlockInfo<H> {
@@ -697,7 +708,7 @@ impl<H> BlockInfo<H> {
 		statuses: Option<Vec<TransactionStatus>>,
 		substrate_hash: H,
 		is_eip1559: bool,
-		base_fee: U256,
+		base_fee: Option<U256>,
 	) -> Self {
 		Self {
 			block,

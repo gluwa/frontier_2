@@ -32,7 +32,7 @@ use fc_rpc_core::types::*;
 use fp_rpc::EthereumRuntimeRPCApi;
 
 use crate::{
-	eth::{rich_block_build, BlockInfo, Eth},
+	eth::{fee::execution_base_fee, rich_block_build, BlockInfo, Eth},
 	frontier_backend_client, internal_err,
 };
 
@@ -61,7 +61,7 @@ where
 					statuses.into_iter().map(Option::Some).collect(),
 					Some(hash),
 					full,
-					Some(base_fee),
+					base_fee,
 					false,
 				);
 
@@ -107,7 +107,7 @@ where
 					.current_transaction_statuses(substrate_hash)
 					.await;
 
-				let base_fee = client.runtime_api().gas_price(substrate_hash).ok();
+				let base_fee = execution_base_fee::<B, C>(client.as_ref(), substrate_hash);
 
 				match (block, statuses) {
 					(Some(block), Some(statuses)) => {
