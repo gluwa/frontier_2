@@ -2042,3 +2042,185 @@ mod gasprice_test {
 		});
 	}
 }
+
+/// BLOCKHASH should only return the hash of the 256 most recent complete blocks, and zero for
+/// the current block, future blocks and older ancestors, even when the block hash mapping still
+/// holds an entry for them.
+mod blockhash_test {
+	use super::*;
+	use evm::ExitSucceed;
+
+	// Runtime code (12 bytes): PUSH1 0, CALLDATALOAD, BLOCKHASH, PUSH1 0, MSTORE,
+	// PUSH1 32, PUSH1 0, RETURN. Returns BLOCKHASH(calldata[0..32]).
+	const BLOCKHASH_CONTRACT: &str = "6000354060005260206000f3";
+	const WINDOW: u64 = 256;
+
+	/// Non-zero, distinct block hash stored in the mapping for the given height.
+	fn mapped_hash(number: u64) -> H256 {
+		H256::from(sp_io::hashing::keccak_256(&number.to_be_bytes()))
+	}
+
+	/// Moves the chain to `current` and populates the mapping for every height up to and
+	/// including `current + 1`, so that a zero result can only come from the window check.
+	/// Returns the address of a contract executing BLOCKHASH.
+	fn setup(current: u64) -> H160 {
+		for number in 0..=current + 1 {
+			frame_system::BlockHash::<Test>::insert(number, mapped_hash(number));
+		}
+		System::set_block_number(current);
+
+		let contract_addr = H160::from_str("2000000000000000000000000000000000000001").unwrap();
+		EVM::create_account(
+			contract_addr,
+			hex::decode(BLOCKHASH_CONTRACT).expect("Failed to decode contract"),
+			None,
+		)
+		.expect("contract creation should succeed");
+		contract_addr
+	}
+
+	/// Executes BLOCKHASH(number) in the contract and returns the result.
+	fn block_hash_opcode(contract_addr: H160, number: U256) -> H256 {
+		let max_fee_per_gas = U256::from(2_000_000_000u128);
+		let result = <Test as Config>::Runner::call(
+			H160::default(),
+			contract_addr,
+			number.to_big_endian().to_vec(),
+			U256::zero(),
+			1_000_000,
+			Some(max_fee_per_gas),
+			None,
+			None,
+			Vec::new(),
+			Vec::new(),
+			true, // transactional
+			true, // must be validated
+			None,
+			Some(0),
+			<Test as Config>::config(),
+		)
+		.expect("contract call should succeed");
+		assert_eq!(
+			result.exit_reason,
+			crate::ExitReason::Succeed(ExitSucceed::Returned)
+		);
+		H256::from_slice(&result.value)
+	}
+
+	#[test]
+	fn blockhash_returns_zero_for_genesis_outside_window() {
+		new_test_ext().execute_with(|| {
+			let current = WINDOW + 44;
+			let contract_addr = setup(current);
+
+			// The mapping still retains the genesis entry...
+			assert_eq!(
+				<Test as Config>::BlockHashMapping::block_hash(0),
+				mapped_hash(0)
+			);
+			// ...but it is more than 256 blocks old, so the opcode must not expose it.
+			assert_eq!(block_hash_opcode(contract_addr, U256::zero()), H256::zero());
+		});
+	}
+
+	#[test]
+	fn blockhash_window_boundaries() {
+		new_test_ext().execute_with(|| {
+			let current = WINDOW + 44;
+			let contract_addr = setup(current);
+
+			// Oldest ancestor still in the window (current - 256).
+			assert_eq!(
+				block_hash_opcode(contract_addr, U256::from(current - WINDOW)),
+				mapped_hash(current - WINDOW)
+			);
+			// One block older (current - 257) is out of the window, although still mapped.
+			assert_eq!(
+				<Test as Config>::BlockHashMapping::block_hash((current - WINDOW - 1) as u32),
+				mapped_hash(current - WINDOW - 1)
+			);
+			assert_eq!(
+				block_hash_opcode(contract_addr, U256::from(current - WINDOW - 1)),
+				H256::zero()
+			);
+			// Most recent ancestors are returned.
+			assert_eq!(
+				block_hash_opcode(contract_addr, U256::from(current - 1)),
+				mapped_hash(current - 1)
+			);
+			assert_eq!(
+				block_hash_opcode(contract_addr, U256::from(current - 2)),
+				mapped_hash(current - 2)
+			);
+		});
+	}
+
+	#[test]
+	fn blockhash_returns_zero_for_current_and_future_blocks() {
+		new_test_ext().execute_with(|| {
+			let current = WINDOW + 44;
+			let contract_addr = setup(current);
+
+			// Current block, even though the mapping holds an entry for it.
+			assert_eq!(
+				<Test as Config>::BlockHashMapping::block_hash(current as u32),
+				mapped_hash(current)
+			);
+			assert_eq!(
+				block_hash_opcode(contract_addr, U256::from(current)),
+				H256::zero()
+			);
+			// Future blocks.
+			assert_eq!(
+				block_hash_opcode(contract_addr, U256::from(current + 1)),
+				H256::zero()
+			);
+			assert_eq!(
+				block_hash_opcode(contract_addr, U256::from(u32::MAX)),
+				H256::zero()
+			);
+			assert_eq!(
+				block_hash_opcode(contract_addr, U256::from(u32::MAX) + 1),
+				H256::zero()
+			);
+			assert_eq!(block_hash_opcode(contract_addr, U256::MAX), H256::zero());
+		});
+	}
+
+	#[test]
+	fn blockhash_genesis_is_only_available_within_window() {
+		// Genesis is exactly `current` blocks old.
+		for (current, available) in [
+			(1, true),
+			(100, true),
+			(WINDOW - 1, true),
+			(WINDOW, true),
+			(WINDOW + 1, false),
+			(WINDOW + 2, false),
+		] {
+			new_test_ext().execute_with(|| {
+				let contract_addr = setup(current);
+				let expected = if available {
+					mapped_hash(0)
+				} else {
+					H256::zero()
+				};
+				assert_eq!(
+					block_hash_opcode(contract_addr, U256::zero()),
+					expected,
+					"unexpected BLOCKHASH(0) at block {current}"
+				);
+			});
+		}
+	}
+
+	#[test]
+	fn blockhash_does_not_underflow_at_genesis() {
+		new_test_ext().execute_with(|| {
+			// With block 0 as the current block there are no ancestors yet.
+			let contract_addr = setup(0);
+			assert_eq!(block_hash_opcode(contract_addr, U256::zero()), H256::zero());
+			assert_eq!(block_hash_opcode(contract_addr, U256::one()), H256::zero());
+		});
+	}
+}
