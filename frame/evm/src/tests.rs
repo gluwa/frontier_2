@@ -623,6 +623,209 @@ mod proof_size_test {
 			assert_eq!(used_gas.effective, U256::from(actual_proof_size * ratio));
 		});
 	}
+
+	fn dispatch_call(
+		target: H160,
+		input: Vec<u8>,
+		value: U256,
+		gas_limit: u64,
+	) -> frame_support::dispatch::DispatchResultWithPostInfo {
+		EVM::call(
+			RuntimeOrigin::root(),
+			H160::default(),
+			target,
+			input,
+			value,
+			gas_limit,
+			FixedGasPrice::min_gas_price().0,
+			None,
+			None,
+			Vec::new(),
+			Vec::new(),
+		)
+	}
+
+	#[test]
+	fn dispatched_call_post_info_uses_effective_gas() {
+		new_test_ext().execute_with(|| {
+			System::set_block_number(1);
+
+			// A plain transfer to an address with a large stored code costs 21_000 standard gas,
+			// but the proof size of loading the code dominates the effective gas.
+			let fake_contract_address = H160::random();
+			let config = <Test as Config>::config().clone();
+			let fake_contract_code = vec![0; config.create_contract_limit.expect("a value")];
+			AccountCodes::<Test>::insert(fake_contract_address, fake_contract_code);
+
+			let post_info = dispatch_call(
+				fake_contract_address,
+				Vec::new(),
+				U256::from(777),
+				1_000_000,
+			)
+			.expect("call succeeds");
+			let actual_weight = post_info.actual_weight.expect("actual weight");
+
+			System::assert_has_event(
+				crate::Event::<Test>::Executed {
+					address: fake_contract_address,
+				}
+				.into(),
+			);
+
+			let ratio = <<Test as Config>::GasLimitPovSizeRatio as Get<u64>>::get();
+			let effective_gas = actual_weight.proof_size() * ratio;
+			assert!(effective_gas > 21_000 && effective_gas < 1_000_000);
+			assert_eq!(
+				actual_weight.ref_time(),
+				FixedGasWeightMapping::<Test>::gas_to_weight(effective_gas, true).ref_time()
+			);
+			assert!(
+				actual_weight.ref_time()
+					> FixedGasWeightMapping::<Test>::gas_to_weight(21_000, true).ref_time()
+			);
+		});
+	}
+
+	#[test]
+	fn dispatched_call_is_bound_by_proof_size_limit() {
+		new_test_ext().execute_with(|| {
+			System::set_block_number(1);
+
+			// The gas limit covers the standard cost of a transfer, but the proof size derived from
+			// it can not fit the stored code of the target.
+			let fake_contract_address = H160::random();
+			let config = <Test as Config>::config().clone();
+			let fake_contract_code = vec![0; config.create_contract_limit.expect("a value")];
+			AccountCodes::<Test>::insert(fake_contract_address, fake_contract_code);
+
+			assert_ok!(dispatch_call(
+				fake_contract_address,
+				Vec::new(),
+				U256::from(777),
+				21_000,
+			));
+
+			System::assert_has_event(
+				crate::Event::<Test>::ExecutedFailed {
+					address: fake_contract_address,
+				}
+				.into(),
+			);
+			assert_eq!(
+				EVM::account_basic(&fake_contract_address).0.balance,
+				U256::zero()
+			);
+		});
+	}
+
+	#[test]
+	fn dispatched_call_is_rejected_when_encoded_call_exceeds_proof_size_limit() {
+		new_test_ext().execute_with(|| {
+			System::set_block_number(1);
+
+			let ratio = <<Test as Config>::GasLimitPovSizeRatio as Get<u64>>::get();
+			let target = H160::random();
+			let value = U256::from(777);
+			let input = vec![0u8; 10_000];
+
+			// The gas limit pays for the call data, including its floor cost, but the proof size
+			// derived from it can not fit the encoded call.
+			let gas_limit = 21_000 + 10 * input.len() as u64;
+			assert!(gas_limit / ratio < input.len() as u64);
+
+			// Without a proof size limit the call is valid.
+			<Test as Config>::Runner::validate(
+				H160::default(),
+				Some(target),
+				input.clone(),
+				value,
+				gas_limit,
+				Some(FixedGasPrice::min_gas_price().0),
+				None,
+				None,
+				Vec::new(),
+				Vec::new(),
+				true,
+				None,
+				None,
+				<Test as Config>::config(),
+			)
+			.expect("call is valid without a proof size limit");
+
+			let err = dispatch_call(target, input.clone(), value, gas_limit)
+				.expect_err("call is rejected");
+			assert_eq!(err.error, crate::Error::<Test>::GasLimitTooLow.into());
+			// The call is rejected before any execution, so only the validation is accounted for,
+			// not the weight derived from the gas limit.
+			let declared_weight = FixedGasWeightMapping::<Test>::gas_to_weight(gas_limit, true);
+			assert!(err
+				.post_info
+				.actual_weight
+				.expect("actual weight")
+				.all_lt(declared_weight));
+			assert_eq!(err.post_info.pays_fee, frame_support::dispatch::Pays::Yes);
+			assert_eq!(EVM::account_basic(&target).0.balance, U256::zero());
+			assert!(System::events().is_empty());
+
+			// The same call is executed when the proof size limit fits the encoded call.
+			let gas_limit = gas_limit.max(ratio * (input.len() as u64 + 1_000));
+			assert_ok!(dispatch_call(target, input, value, gas_limit));
+			System::assert_has_event(crate::Event::<Test>::Executed { address: target }.into());
+			assert_eq!(EVM::account_basic(&target).0.balance, value);
+		});
+	}
+
+	#[test]
+	fn dispatched_call_reports_dynamic_proof_size() {
+		new_test_ext().execute_with(|| {
+			let gas_limit: u64 = 1_000_000;
+
+			// Create proof size test contract
+			let result = create_proof_size_test_contract(gas_limit, None).expect("create succeeds");
+			let call_contract_address = result.value;
+
+			// selector for ProofSizeTest::test_sload function
+			let call_data = hex::decode("e27a0ecd").unwrap();
+			let post_info = dispatch_call(
+				call_contract_address,
+				call_data.clone(),
+				U256::zero(),
+				gas_limit,
+			)
+			.expect("call succeeds");
+			let actual_weight = post_info.actual_weight.expect("actual weight");
+
+			// The encoded call is part of the proof, on top of the dynamic reads.
+			let proof_size_base_cost = crate::Call::<Test>::call {
+				source: H160::default(),
+				target: call_contract_address,
+				input: call_data,
+				value: U256::zero(),
+				gas_limit,
+				max_fee_per_gas: FixedGasPrice::min_gas_price().0,
+				max_priority_fee_per_gas: None,
+				nonce: None,
+				access_list: Vec::new(),
+				authorization_list: Vec::new(),
+			}
+			.encoded_size() as u64
+				// signature
+				+ 65
+				// pallet index
+				+ 1;
+			let reading_main_contract_len =
+				AccountCodes::<Test>::get(call_contract_address).len() as u64;
+			let expected_proof_size = proof_size_base_cost
+				+ reading_main_contract_len
+				+ ACCOUNT_STORAGE_PROOF_SIZE
+				+ ACCOUNT_CODES_METADATA_PROOF_SIZE
+				+ IS_EMPTY_CHECK_PROOF_SIZE
+				+ (ACCOUNT_BASIC_PROOF_SIZE * 2);
+
+			assert_eq!(actual_weight.proof_size(), expected_proof_size);
+		});
+	}
 }
 
 mod storage_growth_test {

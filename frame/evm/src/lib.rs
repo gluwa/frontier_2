@@ -331,6 +331,23 @@ pub mod pallet {
 		) -> DispatchResultWithPostInfo {
 			T::CallOrigin::ensure_address_origin(&source, origin)?;
 
+			let (weight_limit, proof_size_base_cost) = Self::call_weight_limits(
+				gas_limit,
+				(
+					&source,
+					&target,
+					&input,
+					&value,
+					&gas_limit,
+					&max_fee_per_gas,
+					&max_priority_fee_per_gas,
+					&nonce,
+					&access_list,
+					&authorization_list,
+				)
+					.encoded_size(),
+			);
+
 			let is_transactional = true;
 			let validate = true;
 			let info = match T::Runner::call(
@@ -346,8 +363,8 @@ pub mod pallet {
 				authorization_list,
 				is_transactional,
 				validate,
-				None,
-				None,
+				weight_limit,
+				proof_size_base_cost,
 				T::config(),
 			) {
 				Ok(info) => info,
@@ -373,10 +390,11 @@ pub mod pallet {
 
 			Ok(PostDispatchInfo {
 				actual_weight: {
-					let mut gas_to_weight = T::GasWeightMapping::gas_to_weight(
-						info.used_gas.standard.unique_saturated_into(),
-						true,
-					);
+					// Charge for the greater of the gas measured by the gasometer and the gas
+					// accounting for external costs (proof size, storage growth).
+					let used_gas = core::cmp::max(info.used_gas.standard, info.used_gas.effective);
+					let mut gas_to_weight =
+						T::GasWeightMapping::gas_to_weight(used_gas.unique_saturated_into(), true);
 					if let Some(weight_info) = info.weight_info {
 						if let Some(proof_size_usage) = weight_info.proof_size_usage {
 							*gas_to_weight.proof_size_mut() = proof_size_usage;
@@ -941,6 +959,33 @@ where
 }
 
 impl<T: Config> Pallet<T> {
+	/// Derive the weight limit and the proof size base cost handed to the runner for a dispatched
+	/// call, mirroring how a transacted Ethereum transaction is bounded.
+	///
+	/// The weight limit is the weight declared by the dispatchable for `gas_limit`, and the base
+	/// cost accounts for the encoded call that is part of the proof. No limit is enforced when the
+	/// gas to weight mapping does not provide a proof size.
+	fn call_weight_limits(
+		gas_limit: u64,
+		encoded_args_len: usize,
+	) -> (Option<Weight>, Option<u64>) {
+		match T::GasWeightMapping::gas_to_weight(gas_limit, true) {
+			weight_limit if weight_limit.proof_size() > 0 => (
+				Some(weight_limit),
+				Some(
+					(encoded_args_len as u64)
+						// signature
+						.saturating_add(65)
+						// pallet index
+						.saturating_add(1)
+						// call index
+						.saturating_add(1),
+				),
+			),
+			_ => (None, None),
+		}
+	}
+
 	/// Check whether an account is empty.
 	pub fn is_account_empty(address: &H160) -> bool {
 		let (account, _) = Self::account_basic(address);
