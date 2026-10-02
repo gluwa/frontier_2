@@ -271,6 +271,11 @@ pub mod pallet {
 			if let Ok(log) = fp_consensus::find_pre_log(&frame_system::Pallet::<T>::digest()) {
 				let PreLog::Block(block) = log;
 
+				// The block gas limit may be an adjustment algorithm backed by storage.
+				let block_gas_limit = T::BlockGasLimit::get();
+				weight = weight.saturating_add(T::DbWeight::get().reads(1));
+				let mut cumulative_gas_used = U256::zero();
+
 				for transaction in block.transactions {
 					let source = Self::recover_signer(&transaction).expect(
 						"pre-block transaction signature invalid; the block cannot be built",
@@ -279,8 +284,22 @@ pub mod pallet {
 					Self::validate_transaction_in_block(source, &transaction).expect(
 						"pre-block transaction verification failed; the block cannot be built",
 					);
-					let (r, _) = Self::apply_validated_transaction(source, transaction, None)
+					let (r, info) = Self::apply_validated_transaction(source, transaction, None)
 						.expect("pre-block apply transaction failed; the block cannot be built");
+
+					// Stop as soon as the batch exceeds the block gas limit, instead of applying the
+					// remaining transactions of a block that is going to be rejected. This bounds the
+					// work done for a block to about its gas limit. `store_block` still checks the
+					// cumulative gas against the limit stored in the header.
+					let used_gas = match info {
+						CallOrCreateInfo::Call(info) => info.used_gas.effective,
+						CallOrCreateInfo::Create(info) => info.used_gas.effective,
+					};
+					cumulative_gas_used = cumulative_gas_used.saturating_add(used_gas);
+					assert!(
+						cumulative_gas_used <= block_gas_limit,
+						"pre-block gas used exceeds the block gas limit; the block cannot be built",
+					);
 
 					weight = weight.saturating_add(r.actual_weight.unwrap_or_default());
 				}
