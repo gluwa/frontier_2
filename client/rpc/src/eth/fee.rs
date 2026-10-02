@@ -169,23 +169,34 @@ where
 		let lowest = highest.saturating_sub(block_count - 1);
 
 		// https://github.com/ethereum/go-ethereum/blob/master/eth/gasprice/gasprice.go#L149
-		let mut rewards = Vec::new();
-		if let Ok(fee_history_cache) = &self.fee_history_cache.lock() {
-			for n in lowest..highest + 1 {
-				if let Some(block) = fee_history_cache.get(&n) {
-					let reward = if let Some(r) = block.rewards.get(index) {
-						U256::from(*r)
-					} else {
-						U256::zero()
-					};
-					rewards.push(reward);
-				}
-			}
-		} else {
+		let Ok(fee_history_cache) = self.fee_history_cache.lock() else {
 			return Err(internal_err("Failed to read fee oracle cache."));
-		}
-		Ok(*rewards.iter().min().unwrap_or(&U256::zero()))
+		};
+		Ok(lowest_cached_reward(
+			&fee_history_cache,
+			lowest,
+			highest,
+			index,
+		))
 	}
+}
+
+/// Lowest reward at percentile `index` among the cached blocks in `lowest..=highest`.
+///
+/// Zero when none of the blocks is cached.
+fn lowest_cached_reward(
+	fee_history_cache: &BTreeMap<u64, FeeHistoryCacheItem>,
+	lowest: u64,
+	highest: u64,
+	index: usize,
+) -> U256 {
+	let mut rewards = Vec::new();
+	for n in lowest..highest + 1 {
+		if let Some(block) = fee_history_cache.get(&n) {
+			rewards.push(block.rewards.get(index).copied().unwrap_or_default());
+		}
+	}
+	rewards.into_iter().min().unwrap_or_default()
 }
 
 /// Collects the cached fee history of the blocks in `lowest..=highest`.
@@ -218,11 +229,11 @@ fn fee_history_from_cache(
 					let p = p.clamp(0.0, 100.0);
 					let index = ((p.round() / 2f64) * 2f64) * resolution_per_percentile;
 					// Get and push the reward.
-					let reward = if let Some(r) = block.rewards.get(index as usize) {
-						U256::from(*r)
-					} else {
-						U256::zero()
-					};
+					let reward = block
+						.rewards
+						.get(index as usize)
+						.copied()
+						.unwrap_or_default();
 					block_rewards.push(reward);
 				}
 				// Push block rewards.
@@ -496,5 +507,133 @@ mod precision_tests {
 			next_base_fee(U256::from(1_000u64), f64::NAN, ELASTICITY),
 			U256::from(1_000u64)
 		);
+	}
+
+	/// Gas used by each transaction of the blocks built below.
+	const TX_GAS: u64 = 21_000;
+
+	fn signature() -> ethereum::eip2930::TransactionSignature {
+		ethereum::eip2930::TransactionSignature::new(
+			false,
+			H256::from_low_u64_be(1),
+			H256::from_low_u64_be(1),
+		)
+		.expect("valid signature")
+	}
+
+	fn eip1559_tx(
+		max_priority_fee_per_gas: U256,
+		max_fee_per_gas: U256,
+	) -> ethereum::TransactionV3 {
+		ethereum::TransactionV3::EIP1559(ethereum::EIP1559Transaction {
+			chain_id: 42,
+			nonce: U256::zero(),
+			max_priority_fee_per_gas,
+			max_fee_per_gas,
+			gas_limit: U256::from(TX_GAS),
+			action: ethereum::TransactionAction::Call(H160::repeat_byte(1)),
+			value: U256::zero(),
+			input: Vec::new(),
+			access_list: Vec::new(),
+			signature: signature(),
+		})
+	}
+
+	fn legacy_tx(gas_price: U256) -> ethereum::TransactionV3 {
+		ethereum::TransactionV3::Legacy(ethereum::LegacyTransaction {
+			nonce: U256::zero(),
+			gas_price,
+			gas_limit: U256::from(TX_GAS),
+			action: ethereum::TransactionAction::Call(H160::repeat_byte(1)),
+			value: U256::zero(),
+			input: Vec::new(),
+			signature: ethereum::legacy::TransactionSignature::new(
+				27,
+				H256::from_low_u64_be(1),
+				H256::from_low_u64_be(1),
+			)
+			.expect("valid signature"),
+		})
+	}
+
+	/// Priority fees above the `u64` range. The first two differ only above `u64::MAX`.
+	fn large_tips() -> [U256; 3] {
+		let above_u64 = U256::from(u64::MAX) + 1;
+		[above_u64, above_u64 + 1, U256::from(u128::MAX) * 3]
+	}
+
+	/// Cache item of block number 1, whose transactions pay `large_tips()` on top of `base_fee`
+	/// through the fee cap, the legacy gas price and the priority fee respectively.
+	fn large_tip_cache_item(base_fee: U256) -> FeeHistoryCacheItem {
+		let [low, mid, high] = large_tips();
+		let transactions = vec![
+			eip1559_tx(mid, U256::MAX),
+			legacy_tx(base_fee + low),
+			eip1559_tx(U256::MAX, base_fee + high),
+		];
+		let receipts = transactions
+			.iter()
+			.enumerate()
+			.map(|(i, transaction)| {
+				let data = ethereum::EIP658ReceiptData {
+					status_code: 1,
+					used_gas: U256::from(TX_GAS * (i as u64 + 1)),
+					logs_bloom: ethereum_types::Bloom::default(),
+					logs: Vec::new(),
+				};
+				match transaction {
+					ethereum::TransactionV3::Legacy(_) => ethereum::ReceiptV4::Legacy(data),
+					_ => ethereum::ReceiptV4::EIP1559(data),
+				}
+			})
+			.collect();
+		let mut block = ethereum_block(1, 1_000_000, TX_GAS * 3);
+		block.transactions = transactions;
+		let (item, number) = build_fee_history_cache_item(Some(block), Some(receipts), base_fee);
+		assert_eq!(number, Some(1));
+		item
+	}
+
+	#[test]
+	fn cache_item_keeps_priority_fees_above_u64() {
+		let [low, mid, high] = large_tips();
+		let item = large_tip_cache_item(U256::from(1_000u64));
+		assert_eq!(item.rewards.len(), 201);
+		// All transactions use the same gas, so the percentiles pick the sorted tips in order.
+		assert_eq!(item.rewards[0], low);
+		assert_eq!(item.rewards[100], mid);
+		assert_eq!(item.rewards[200], high);
+	}
+
+	#[test]
+	fn fee_history_reports_priority_fees_above_u64() {
+		let [low, mid, high] = large_tips();
+		let mut cache = BTreeMap::new();
+		cache.insert(1, large_tip_cache_item(U256::from(1_000u64)));
+
+		let response = fee_history_from_cache(&cache, 1, 1, Some(&[0.0, 50.0, 100.0]));
+		assert_eq!(response.reward, Some(vec![vec![low, mid, high]]));
+	}
+
+	#[test]
+	fn lowest_cached_reward_keeps_full_precision() {
+		let [low, mid, high] = large_tips();
+		let item = |reward: U256| FeeHistoryCacheItem {
+			base_fee: U256::zero(),
+			gas_used_ratio: 0f64,
+			rewards: vec![reward; 201],
+		};
+		let mut cache = BTreeMap::new();
+		cache.insert(1, item(mid));
+		cache.insert(2, item(high));
+		cache.insert(3, item(low));
+
+		assert_eq!(lowest_cached_reward(&cache, 1, 3, 120), low);
+		assert_eq!(lowest_cached_reward(&cache, 1, 2, 120), mid);
+		assert_eq!(lowest_cached_reward(&cache, 2, 2, 120), high);
+		// Nothing cached in the range.
+		assert_eq!(lowest_cached_reward(&cache, 10, 12, 120), U256::zero());
+		// A block without a reward at the percentile counts as zero.
+		assert_eq!(lowest_cached_reward(&cache, 1, 3, 201), U256::zero());
 	}
 }

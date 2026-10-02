@@ -353,7 +353,7 @@ pub(crate) fn build_fee_history_cache_item(
 ) -> (FeeHistoryCacheItem, Option<u64>) {
 	struct TransactionHelper {
 		gas_used: u64,
-		effective_reward: u64,
+		effective_reward: U256,
 	}
 
 	// Evenly spaced percentile list from 0.0 to 100.0 with a 0.5 resolution.
@@ -408,28 +408,18 @@ pub(crate) fn build_fee_history_cache_item(
 				},
 				effective_reward: match block.transactions.get(i) {
 					Some(ethereum::TransactionV3::Legacy(t)) => {
-						UniqueSaturatedInto::<u64>::unique_saturated_into(
-							t.gas_price.saturating_sub(base_fee),
-						)
+						t.gas_price.saturating_sub(base_fee)
 					}
 					Some(ethereum::TransactionV3::EIP2930(t)) => {
-						UniqueSaturatedInto::<u64>::unique_saturated_into(
-							t.gas_price.saturating_sub(base_fee),
-						)
+						t.gas_price.saturating_sub(base_fee)
 					}
-					Some(ethereum::TransactionV3::EIP1559(t)) => {
-						UniqueSaturatedInto::<u64>::unique_saturated_into(
-							t.max_priority_fee_per_gas
-								.min(t.max_fee_per_gas.saturating_sub(base_fee)),
-						)
-					}
-					Some(ethereum::TransactionV3::EIP7702(t)) => {
-						UniqueSaturatedInto::<u64>::unique_saturated_into(
-							t.max_priority_fee_per_gas
-								.min(t.max_fee_per_gas.saturating_sub(base_fee)),
-						)
-					}
-					None => 0,
+					Some(ethereum::TransactionV3::EIP1559(t)) => t
+						.max_priority_fee_per_gas
+						.min(t.max_fee_per_gas.saturating_sub(base_fee)),
+					Some(ethereum::TransactionV3::EIP7702(t)) => t
+						.max_priority_fee_per_gas
+						.min(t.max_fee_per_gas.saturating_sub(base_fee)),
+					None => U256::zero(),
 				},
 			})
 			.collect();
@@ -452,7 +442,7 @@ pub(crate) fn build_fee_history_cache_item(
 			})
 			.collect();
 	} else {
-		result.rewards = reward_percentiles.iter().map(|_| 0).collect();
+		result.rewards = reward_percentiles.iter().map(|_| U256::zero()).collect();
 	}
 	(result, block_number)
 }

@@ -526,7 +526,7 @@ fn block_transaction_and_fee_history_agree_on_the_execution_base_fee() {
 
 		// Fee history rewards are the effective priority fees (all transactions use the same
 		// gas, so the percentiles pick the sorted tips in order).
-		let mut sorted_tips = tips.clone();
+		let mut sorted_tips: Vec<U256> = tips.iter().copied().map(U256::from).collect();
 		sorted_tips.sort();
 		assert_eq!(cache_item.rewards.len(), 201);
 		assert_eq!(cache_item.rewards[0], sorted_tips[0]);
@@ -626,13 +626,13 @@ fn fee_history_rewards_depend_on_the_base_fee_used() {
 		build_fee_history_cache_item(Some(block), Some(receipts), U256::from(1_125));
 
 	assert_eq!(executed.base_fee, U256::from(1_000));
-	assert_eq!(executed.rewards[0], 0);
-	assert_eq!(executed.rewards[150], 50);
-	assert_eq!(executed.rewards[200], 130);
+	assert_eq!(executed.rewards[0], U256::from(0));
+	assert_eq!(executed.rewards[150], U256::from(50));
+	assert_eq!(executed.rewards[200], U256::from(130));
 	assert_eq!(adjusted.base_fee, U256::from(1_125));
-	assert_eq!(adjusted.rewards[0], 0);
-	assert_eq!(adjusted.rewards[150], 5);
-	assert_eq!(adjusted.rewards[200], 7);
+	assert_eq!(adjusted.rewards[0], U256::from(0));
+	assert_eq!(adjusted.rewards[150], U256::from(5));
+	assert_eq!(adjusted.rewards[200], U256::from(7));
 	// Unchanged by the base fee: the zero tip.
 	assert_eq!(executed.gas_used_ratio, adjusted.gas_used_ratio);
 }
@@ -643,5 +643,5 @@ fn fee_history_entry_without_block_data_has_zero_rewards() {
 	assert_eq!(cache_number, None);
 	assert_eq!(cache_item.base_fee, U256::from(1_000));
 	assert_eq!(cache_item.gas_used_ratio, 0f64);
-	assert_eq!(cache_item.rewards, vec![0; 201]);
+	assert_eq!(cache_item.rewards, vec![U256::zero(); 201]);
 }

@@ -50,5 +50,5 @@ pub type FeeHistoryCacheLimit = u64;
 pub struct FeeHistoryCacheItem {
 	pub base_fee: U256,
 	pub gas_used_ratio: f64,
-	pub rewards: Vec<u64>,
+	pub rewards: Vec<U256>,
 }
