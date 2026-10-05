@@ -38,7 +38,7 @@ use sp_runtime::{
 use sp_state_machine::OverlayedChanges;
 // Frontier
 use fc_rpc_core::types::*;
-use fp_evm::{ExecutionInfo, ExecutionInfoV2};
+use fp_evm::{ExecutionInfo, ExecutionInfoV2, MAX_AUTHORIZATION_LIST_SIZE};
 use fp_rpc::{EthereumRuntimeRPCApi, RuntimeStorageOverride};
 use fp_storage::constants::{EVM_ACCOUNT_CODES, EVM_ACCOUNT_STORAGES, PALLET_EVM};
 
@@ -65,6 +65,20 @@ impl EstimateGasAdapter for () {
 	}
 }
 
+/// Reject requests whose EIP-7702 authorization list exceeds the protocol limit, before it is
+/// encoded and forwarded to the runtime.
+fn ensure_authorization_list_size(request: &TransactionRequest) -> RpcResult<()> {
+	let len = request.authorization_list.as_ref().map_or(0, Vec::len);
+	if len > MAX_AUTHORIZATION_LIST_SIZE {
+		return Err(crate::err(
+			jsonrpsee::types::error::INVALID_PARAMS_CODE,
+			format!("authorization list too large: {len} > {MAX_AUTHORIZATION_LIST_SIZE}"),
+			None,
+		));
+	}
+	Ok(())
+}
+
 impl<B, C, P, CT, BE, CIDP, EC> Eth<B, C, P, CT, BE, CIDP, EC>
 where
 	B: BlockT,
@@ -82,6 +96,8 @@ where
 		number_or_hash: Option<BlockNumberOrHash>,
 		state_overrides: Option<BTreeMap<H160, CallStateOverride>>,
 	) -> RpcResult<Bytes> {
+		ensure_authorization_list_size(&request)?;
+
 		let TransactionRequest {
 			from,
 			to,
@@ -647,6 +663,8 @@ where
 		request: TransactionRequest,
 		number_or_hash: Option<BlockNumberOrHash>,
 	) -> RpcResult<U256> {
+		ensure_authorization_list_size(&request)?;
+
 		let client = Arc::clone(&self.client);
 		let block_data_cache = Arc::clone(&self.block_data_cache);
 

@@ -45,7 +45,7 @@ use fp_evm::{
 	AccessedStorage, CallInfo, CreateInfo, ExecutionInfoV2, IsPrecompileResult, Log, PrecompileSet,
 	Vicinity, WeightInfo, ACCOUNT_BASIC_PROOF_SIZE, ACCOUNT_CODES_KEY_SIZE,
 	ACCOUNT_CODES_METADATA_PROOF_SIZE, ACCOUNT_STORAGE_PROOF_SIZE, IS_EMPTY_CHECK_PROOF_SIZE,
-	WRITE_PROOF_SIZE,
+	MAX_AUTHORIZATION_LIST_SIZE, WRITE_PROOF_SIZE,
 };
 
 use super::meter::StorageMeter;
@@ -77,6 +77,24 @@ impl<T: Config> Runner<T>
 where
 	BalanceOf<T>: TryFrom<U256> + Into<U256>,
 {
+	/// Reject an authorization list longer than `MAX_AUTHORIZATION_LIST_SIZE`.
+	///
+	/// This must run before any per-entry work (signer recovery, allocation, cloning) and applies
+	/// to every entry point, including non-transactional runtime API calls, so that the
+	/// preprocessing cost of a request is bounded regardless of `validate`.
+	fn ensure_authorization_list_size(
+		authorization_list: &AuthorizationList,
+	) -> Result<(), RunnerError<Error<T>>> {
+		if authorization_list.len() > MAX_AUTHORIZATION_LIST_SIZE {
+			let (_, weight) = T::FeeCalculator::min_gas_price();
+			return Err(RunnerError {
+				error: Error::<T>::AuthorizationListTooLarge,
+				weight,
+			});
+		}
+		Ok(())
+	}
+
 	#[allow(clippy::let_and_return)]
 	/// Execute an already validated EVM operation.
 	fn execute<'config, 'precompiles, F, R>(
@@ -558,6 +576,8 @@ where
 	) -> Result<CallInfo, RunnerError<Self::Error>> {
 		let measured_proof_size_before = get_proof_size().unwrap_or_default();
 
+		Self::ensure_authorization_list_size(&authorization_list)?;
+
 		let authorization_list = authorization_list
 			.iter()
 			.map(|d| {
@@ -637,6 +657,8 @@ where
 
 		T::CreateOriginFilter::check_create_origin(&source)
 			.map_err(|error| RunnerError { error, weight })?;
+
+		Self::ensure_authorization_list_size(&authorization_list)?;
 
 		let authorization_list = authorization_list
 			.iter()
@@ -720,6 +742,8 @@ where
 
 		T::CreateOriginFilter::check_create_origin(&source)
 			.map_err(|error| RunnerError { error, weight })?;
+
+		Self::ensure_authorization_list_size(&authorization_list)?;
 
 		let authorization_list = authorization_list
 			.iter()
@@ -809,6 +833,8 @@ where
 
 		T::CreateOriginFilter::check_create_origin(&source)
 			.map_err(|error| RunnerError { error, weight })?;
+
+		Self::ensure_authorization_list_size(&authorization_list)?;
 
 		let authorization_list = authorization_list
 			.iter()

@@ -631,6 +631,8 @@ pub mod pallet {
 		Undefined,
 		/// Address not allowed to deploy contracts either via CREATE or CALL(CREATE).
 		CreateOriginNotAllowed,
+		/// The EIP-7702 authorization list exceeds the maximum number of entries.
+		AuthorizationListTooLarge,
 	}
 
 	impl<T> From<TransactionValidationError> for Error<T> {
@@ -647,7 +649,9 @@ pub mod pallet {
 				TransactionValidationError::InvalidChainId => Error::<T>::InvalidChainId,
 				TransactionValidationError::InvalidSignature => Error::<T>::InvalidSignature,
 				TransactionValidationError::EmptyAuthorizationList => Error::<T>::Undefined,
-				TransactionValidationError::AuthorizationListTooLarge => Error::<T>::Undefined,
+				TransactionValidationError::AuthorizationListTooLarge => {
+					Error::<T>::AuthorizationListTooLarge
+				}
 				TransactionValidationError::InvalidAuthorizationCreate => Error::<T>::Undefined,
 				TransactionValidationError::UnknownError => Error::<T>::Undefined,
 			}
