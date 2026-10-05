@@ -311,7 +311,6 @@ impl<'config, E: From<TransactionValidationError>> CheckEvmTransaction<'config, 
 			}
 
 			// EIP-7702 validation: Check authorization list size (DoS protection)
-			const MAX_AUTHORIZATION_LIST_SIZE: usize = 255;
 			if self.transaction.authorization_list.len() > MAX_AUTHORIZATION_LIST_SIZE {
 				return Err(TransactionValidationError::AuthorizationListTooLarge.into());
 			}
