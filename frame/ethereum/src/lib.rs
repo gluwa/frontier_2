@@ -623,15 +623,21 @@ impl<T: Config> Pallet<T> {
 
 	/// Extract the `Executed` event extra data from the return data of a reverted call.
 	///
-	/// The result never exceeds `T::ExtraDataLength` bytes: well-formed ABI `Error(string)`
+	/// The result never exceeds `T::ExtraDataLength` bytes: canonical ABI `Error(string)`
 	/// payloads yield the (capped) message, anything else yields a capped prefix of the raw data.
 	fn revert_extra_data(data: Vec<u8>) -> Vec<u8> {
+		// `Error(string)` selector.
+		const ERROR_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+		const OFFSET_START: usize = 4;
 		const LEN_START: usize = 36;
 		const MESSAGE_START: usize = 68;
 
 		let cap = T::ExtraDataLength::get() as usize;
 
-		if data.len() > MESSAGE_START {
+		if data.len() >= MESSAGE_START
+			&& data[..OFFSET_START] == ERROR_SELECTOR
+			&& U256::from_big_endian(&data[OFFSET_START..LEN_START]) == U256::from(32)
+		{
 			let message_len =
 				U256::from_big_endian(&data[LEN_START..MESSAGE_START]).saturated_into::<usize>();
 			let message_end = MESSAGE_START.saturating_add(message_len.min(cap));
@@ -641,7 +647,7 @@ impl<T: Config> Pallet<T> {
 			}
 		}
 
-		// Short or malformed payload: return a bounded prefix of the raw data.
+		// Not a canonical `Error(string)`: return a bounded prefix of the raw data.
 		let mut data = data;
 		data.truncate(cap);
 		data

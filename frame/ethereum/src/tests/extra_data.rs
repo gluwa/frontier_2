@@ -70,6 +70,43 @@ fn huge_declared_length_is_capped() {
 }
 
 #[test]
+fn empty_error_string_decodes_to_empty() {
+	let data = error_payload(0, b"");
+	assert_eq!(data.len(), 68);
+	assert!(Ethereum::revert_extra_data(data).is_empty());
+}
+
+#[test]
+fn non_error_selector_returns_raw_prefix() {
+	// Error-like layout (small length at 36..68) but a custom-error selector.
+	let mut data = error_payload(5, b"hello");
+	data[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+	assert_eq!(
+		Ethereum::revert_extra_data(data.clone()),
+		data[..CAP].to_vec()
+	);
+}
+
+#[test]
+fn non_canonical_offset_returns_raw_prefix() {
+	let mut data = error_payload(5, b"hello");
+	data[35] = 0x40;
+	assert_eq!(
+		Ethereum::revert_extra_data(data.clone()),
+		data[..CAP].to_vec()
+	);
+}
+
+#[test]
+fn truncated_payload_returns_raw_prefix() {
+	let data = error_payload(CAP, &vec![b'a'; CAP - 1]);
+	assert_eq!(
+		Ethereum::revert_extra_data(data.clone()),
+		data[..CAP].to_vec()
+	);
+}
+
+#[test]
 fn short_raw_revert_data_is_capped() {
 	// No `Error(string)` framing at all, e.g. a custom error with large arguments.
 	for len in [0, 1, CAP, CAP + 1, 67, 68, 69, 1000] {
