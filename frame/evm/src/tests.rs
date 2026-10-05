@@ -2451,11 +2451,15 @@ mod authorization_list_size_test {
 
 	fn assert_too_large<I: core::fmt::Debug>(result: Result<I, RunnerError<crate::Error<Test>>>) {
 		match result {
-			Err(e) => assert!(
-				matches!(e.error, crate::Error::<Test>::AuthorizationListTooLarge),
-				"unexpected error: {:?}",
-				e.error
-			),
+			Err(e) => {
+				assert!(
+					matches!(e.error, crate::Error::<Test>::AuthorizationListTooLarge),
+					"unexpected error: {:?}",
+					e.error
+				);
+				// Only the fee calculator weight is accounted for.
+				assert_eq!(e.weight, FixedGasPrice::min_gas_price().1);
+			}
 			Ok(info) => panic!("expected AuthorizationListTooLarge, got {info:?}"),
 		}
 	}
@@ -2595,6 +2599,10 @@ mod authorization_list_size_test {
 			)
 			.expect_err("call is rejected");
 			assert_eq!(err.error, expected);
+			assert_eq!(
+				err.post_info.actual_weight,
+				Some(FixedGasPrice::min_gas_price().1)
+			);
 
 			let err = EVM::create(
 				RuntimeOrigin::root(),
@@ -2610,6 +2618,10 @@ mod authorization_list_size_test {
 			)
 			.expect_err("create is rejected");
 			assert_eq!(err.error, expected);
+			assert_eq!(
+				err.post_info.actual_weight,
+				Some(FixedGasPrice::min_gas_price().1)
+			);
 
 			let err = EVM::create2(
 				RuntimeOrigin::root(),
@@ -2626,6 +2638,10 @@ mod authorization_list_size_test {
 			)
 			.expect_err("create2 is rejected");
 			assert_eq!(err.error, expected);
+			assert_eq!(
+				err.post_info.actual_weight,
+				Some(FixedGasPrice::min_gas_price().1)
+			);
 		});
 	}
 }
