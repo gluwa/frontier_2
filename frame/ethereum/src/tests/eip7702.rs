@@ -855,3 +855,96 @@ fn eip7702_create_shape_is_rejected_at_execution() {
 		);
 	});
 }
+
+fn oversized_authorization_list_transaction(
+	signer: &AccountInfo,
+	destination: H160,
+	authorization_list_len: usize,
+) -> Transaction {
+	let authorization =
+		create_authorization_tuple(ChainId::get(), destination, 1, &signer.private_key);
+	eip7702_transaction_unsigned(
+		U256::zero(),
+		U256::from(0x100000),
+		TransactionAction::Call(destination),
+		U256::from(1000),
+		vec![],
+		vec![authorization; authorization_list_len],
+	)
+	.sign(&signer.private_key, Some(ChainId::get()))
+}
+
+fn authorization_list_too_large_error() -> TransactionValidityError {
+	TransactionValidityError::Invalid(InvalidTransaction::Custom(
+		fp_evm::TransactionValidationError::AuthorizationListTooLarge as u8,
+	))
+}
+
+#[test]
+fn eip7702_transaction_with_oversized_authorization_list_is_rejected_up_front() {
+	let (pairs, mut ext) = new_test_ext_with_initial_balance(2, 10_000_000_000_000);
+	let alice = &pairs[0];
+	let bob = &pairs[1];
+
+	ext.execute_with(|| {
+		let transaction = oversized_authorization_list_transaction(
+			alice,
+			bob.address,
+			fp_evm::MAX_AUTHORIZATION_LIST_SIZE + 1,
+		);
+		let call = crate::Call::<Test>::transact {
+			transaction: transaction.clone(),
+		};
+		let dispatch_info = call.get_dispatch_info();
+
+		// Rejected by the earliest hook, before the signer is recovered.
+		assert_eq!(
+			call.check_self_contained().unwrap().unwrap_err(),
+			authorization_list_too_large_error()
+		);
+
+		// And by each of the other entry points, which can be reached without it.
+		assert_eq!(
+			call.validate_self_contained(&alice.address, &dispatch_info, 0)
+				.unwrap()
+				.unwrap_err(),
+			authorization_list_too_large_error()
+		);
+		assert_eq!(
+			call.pre_dispatch_self_contained(&alice.address, &dispatch_info, 0)
+				.unwrap()
+				.unwrap_err(),
+			authorization_list_too_large_error()
+		);
+
+		let err = Ethereum::execute(alice.address, &transaction, None, None)
+			.expect_err("oversized authorization list is rejected at execution");
+		assert_eq!(
+			err.error,
+			pallet_evm::Error::<Test>::AuthorizationListTooLarge.into()
+		);
+		assert_eq!(
+			err.post_info.actual_weight,
+			Some(<<Test as pallet_evm::Config>::FeeCalculator as fp_evm::FeeCalculator>::min_gas_price().1)
+		);
+	});
+}
+
+#[test]
+fn eip7702_transaction_with_maximum_authorization_list_passes_the_size_check() {
+	let (pairs, mut ext) = new_test_ext_with_initial_balance(2, 10_000_000_000_000);
+	let alice = &pairs[0];
+	let bob = &pairs[1];
+
+	ext.execute_with(|| {
+		let transaction = oversized_authorization_list_transaction(
+			alice,
+			bob.address,
+			fp_evm::MAX_AUTHORIZATION_LIST_SIZE,
+		);
+		let call = crate::Call::<Test>::transact { transaction };
+
+		// The size check is not what rejects a list at the limit.
+		assert_eq!(call.check_self_contained().unwrap().unwrap(), alice.address);
+	});
+}

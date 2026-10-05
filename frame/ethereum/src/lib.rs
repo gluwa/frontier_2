@@ -70,6 +70,7 @@ pub use fp_ethereum::TransactionData;
 use fp_ethereum::ValidatedTransaction as ValidatedTransactionT;
 use fp_evm::{
 	CallOrCreateInfo, CheckEvmTransaction, CheckEvmTransactionConfig, TransactionValidationError,
+	MAX_AUTHORIZATION_LIST_SIZE,
 };
 pub use fp_rpc::TransactionStatus;
 use fp_storage::{EthereumStorageSchema, PALLET_ETHEREUM_SCHEMA};
@@ -122,6 +123,9 @@ where
 	pub fn check_self_contained(&self) -> Option<Result<H160, TransactionValidityError>> {
 		if let Call::transact { transaction } = self {
 			let check = || {
+				Pallet::<T>::ensure_authorization_list_size(transaction)
+					.map_err(|e| InvalidTransactionWrapper::from(e).0)?;
+
 				let origin = Pallet::<T>::recover_signer(transaction).ok_or(
 					InvalidTransaction::Custom(TransactionValidationError::InvalidSignature as u8),
 				)?;
@@ -405,6 +409,22 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
+	/// Reject an EIP-7702 transaction whose authorization list is too long.
+	///
+	/// Only the length of the raw list is inspected, so this can run before the transaction is
+	/// cloned, encoded or has its authorizers recovered. The EVM pallet enforces the same limit
+	/// for calls that do not come from an Ethereum transaction.
+	fn ensure_authorization_list_size(
+		transaction: &Transaction,
+	) -> Result<(), TransactionValidationError> {
+		match transaction {
+			Transaction::EIP7702(t) if t.authorization_list.len() > MAX_AUTHORIZATION_LIST_SIZE => {
+				Err(TransactionValidationError::AuthorizationListTooLarge)
+			}
+			_ => Ok(()),
+		}
+	}
+
 	fn recover_signer(transaction: &Transaction) -> Option<H160> {
 		let mut sig = [0u8; 65];
 		let mut msg = [0u8; 32];
@@ -534,6 +554,9 @@ impl<T: Config> Pallet<T> {
 		origin: H160,
 		transaction: &Transaction,
 	) -> TransactionValidity {
+		Self::ensure_authorization_list_size(transaction)
+			.map_err(|e| InvalidTransactionWrapper::from(e).0)?;
+
 		let transaction_data: TransactionData = transaction.into();
 		let transaction_nonce = transaction_data.nonce;
 		let (weight_limit, proof_size_base_cost) = Self::transaction_weight(&transaction_data);
@@ -791,6 +814,16 @@ impl<T: Config> Pallet<T> {
 		config: Option<evm::Config>,
 		maybe_force_create_address: Option<H160>,
 	) -> Result<(Option<H160>, Option<H160>, CallOrCreateInfo), DispatchErrorWithPostInfo> {
+		Self::ensure_authorization_list_size(transaction).map_err(|e| {
+			DispatchErrorWithPostInfo {
+				post_info: PostDispatchInfo {
+					actual_weight: Some(T::FeeCalculator::min_gas_price().1),
+					pays_fee: Pays::Yes,
+				},
+				error: pallet_evm::Error::<T>::from(e).into(),
+			}
+		})?;
+
 		let transaction_data: TransactionData = transaction.into();
 		let (weight_limit, proof_size_base_cost) = Self::transaction_weight(&transaction_data);
 		let is_transactional = true;
@@ -999,6 +1032,9 @@ impl<T: Config> Pallet<T> {
 		origin: H160,
 		transaction: &Transaction,
 	) -> Result<(), TransactionValidityError> {
+		Self::ensure_authorization_list_size(transaction)
+			.map_err(|e| InvalidTransactionWrapper::from(e).0)?;
+
 		let transaction_data: TransactionData = transaction.into();
 		let (weight_limit, proof_size_base_cost) = Self::transaction_weight(&transaction_data);
 		let (base_fee, _) = T::FeeCalculator::min_gas_price();
