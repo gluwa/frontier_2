@@ -2427,3 +2427,221 @@ mod blockhash_test {
 		});
 	}
 }
+
+mod authorization_list_size_test {
+	use super::*;
+	use ethereum::{eip2930::MalleableTransactionSignature, AuthorizationListItem};
+	use fp_evm::MAX_AUTHORIZATION_LIST_SIZE;
+
+	fn authorization_list(len: usize) -> AuthorizationList {
+		vec![
+			AuthorizationListItem {
+				chain_id: 0,
+				address: H160::default(),
+				nonce: U256::zero(),
+				signature: MalleableTransactionSignature {
+					odd_y_parity: false,
+					r: H256::zero(),
+					s: H256::zero(),
+				},
+			};
+			len
+		]
+	}
+
+	fn assert_too_large<I: core::fmt::Debug>(result: Result<I, RunnerError<crate::Error<Test>>>) {
+		match result {
+			Err(e) => {
+				assert!(
+					matches!(e.error, crate::Error::<Test>::AuthorizationListTooLarge),
+					"unexpected error: {:?}",
+					e.error
+				);
+				// Only the fee calculator weight is accounted for.
+				assert_eq!(e.weight, FixedGasPrice::min_gas_price().1);
+			}
+			Ok(info) => panic!("expected AuthorizationListTooLarge, got {info:?}"),
+		}
+	}
+
+	fn is_too_large<I>(result: &Result<I, RunnerError<crate::Error<Test>>>) -> bool {
+		matches!(result, Err(e) if matches!(e.error, crate::Error::<Test>::AuthorizationListTooLarge))
+	}
+
+	#[test]
+	fn runner_rejects_oversized_list_on_every_entry_point() {
+		new_test_ext().execute_with(|| {
+			let max_fee = Some(FixedGasPrice::min_gas_price().0);
+			let oversized = authorization_list(MAX_AUTHORIZATION_LIST_SIZE + 1);
+
+			// Regardless of `validate` and `is_transactional`, the list is rejected up front.
+			for (is_transactional, validate) in
+				[(true, true), (true, false), (false, true), (false, false)]
+			{
+				assert_too_large(<Test as Config>::Runner::call(
+					H160::default(),
+					H160::random(),
+					Vec::new(),
+					U256::zero(),
+					1_000_000,
+					max_fee,
+					None,
+					None,
+					Vec::new(),
+					oversized.clone(),
+					is_transactional,
+					validate,
+					None,
+					None,
+					<Test as Config>::config(),
+				));
+				assert_too_large(<Test as Config>::Runner::create(
+					H160::default(),
+					Vec::new(),
+					U256::zero(),
+					1_000_000,
+					max_fee,
+					None,
+					None,
+					Vec::new(),
+					oversized.clone(),
+					is_transactional,
+					validate,
+					None,
+					None,
+					<Test as Config>::config(),
+				));
+				assert_too_large(<Test as Config>::Runner::create2(
+					H160::default(),
+					Vec::new(),
+					H256::zero(),
+					U256::zero(),
+					1_000_000,
+					max_fee,
+					None,
+					None,
+					Vec::new(),
+					oversized.clone(),
+					is_transactional,
+					validate,
+					None,
+					None,
+					<Test as Config>::config(),
+				));
+				assert_too_large(<Test as Config>::Runner::create_force_address(
+					H160::default(),
+					Vec::new(),
+					U256::zero(),
+					1_000_000,
+					max_fee,
+					None,
+					None,
+					Vec::new(),
+					oversized.clone(),
+					is_transactional,
+					validate,
+					None,
+					None,
+					<Test as Config>::config(),
+					H160::random(),
+				));
+			}
+		});
+	}
+
+	#[test]
+	fn runner_accepts_list_at_the_limit() {
+		new_test_ext().execute_with(|| {
+			// The size check does not reject a list at the limit; whatever the outcome of the call,
+			// it is not `AuthorizationListTooLarge`.
+			let result = <Test as Config>::Runner::call(
+				H160::default(),
+				H160::random(),
+				Vec::new(),
+				U256::zero(),
+				1_000_000,
+				Some(FixedGasPrice::min_gas_price().0),
+				None,
+				None,
+				Vec::new(),
+				authorization_list(MAX_AUTHORIZATION_LIST_SIZE),
+				true,
+				true,
+				None,
+				None,
+				<Test as Config>::config(),
+			);
+			assert!(!is_too_large(&result));
+		});
+	}
+
+	#[test]
+	fn dispatchables_reject_oversized_list() {
+		new_test_ext().execute_with(|| {
+			System::set_block_number(1);
+			let max_fee = FixedGasPrice::min_gas_price().0;
+			let oversized = authorization_list(MAX_AUTHORIZATION_LIST_SIZE + 1);
+			let expected: sp_runtime::DispatchError =
+				crate::Error::<Test>::AuthorizationListTooLarge.into();
+
+			let err = EVM::call(
+				RuntimeOrigin::root(),
+				H160::default(),
+				H160::random(),
+				Vec::new(),
+				U256::zero(),
+				1_000_000,
+				max_fee,
+				None,
+				None,
+				Vec::new(),
+				oversized.clone(),
+			)
+			.expect_err("call is rejected");
+			assert_eq!(err.error, expected);
+			assert_eq!(
+				err.post_info.actual_weight,
+				Some(FixedGasPrice::min_gas_price().1)
+			);
+
+			let err = EVM::create(
+				RuntimeOrigin::root(),
+				H160::default(),
+				Vec::new(),
+				U256::zero(),
+				1_000_000,
+				max_fee,
+				None,
+				None,
+				Vec::new(),
+				oversized.clone(),
+			)
+			.expect_err("create is rejected");
+			assert_eq!(err.error, expected);
+			assert_eq!(
+				err.post_info.actual_weight,
+				Some(FixedGasPrice::min_gas_price().1)
+			);
+
+			let err = EVM::create2(
+				RuntimeOrigin::root(),
+				H160::default(),
+				Vec::new(),
+				H256::zero(),
+				U256::zero(),
+				1_000_000,
+				max_fee,
+				None,
+				None,
+				Vec::new(),
+				oversized,
+			)
+			.expect_err("create2 is rejected");
+			assert_eq!(err.error, expected);
+			assert_eq!(
+				err.post_info.actual_weight,
+				Some(FixedGasPrice::min_gas_price().1)
+			);
+		});
+	}
+}

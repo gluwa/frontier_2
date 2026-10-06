@@ -55,6 +55,12 @@ pub struct CheckEvmTransaction<'config, E: From<TransactionValidationError>> {
 	_marker: core::marker::PhantomData<E>,
 }
 
+/// Maximum number of entries accepted in an EIP-7702 authorization list.
+///
+/// Enforced before any per-entry work (signature recovery, allocation, cloning) so that the
+/// preprocessing cost of a request is bounded.
+pub const MAX_AUTHORIZATION_LIST_SIZE: usize = 255;
+
 /// Transaction validation errors
 #[repr(u8)]
 #[derive(num_enum::FromPrimitive, num_enum::IntoPrimitive, Debug)]
@@ -305,7 +311,6 @@ impl<'config, E: From<TransactionValidationError>> CheckEvmTransaction<'config, 
 			}
 
 			// EIP-7702 validation: Check authorization list size (DoS protection)
-			const MAX_AUTHORIZATION_LIST_SIZE: usize = 255;
 			if self.transaction.authorization_list.len() > MAX_AUTHORIZATION_LIST_SIZE {
 				return Err(TransactionValidationError::AuthorizationListTooLarge.into());
 			}

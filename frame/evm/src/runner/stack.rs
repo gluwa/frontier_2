@@ -558,6 +558,10 @@ where
 	) -> Result<CallInfo, RunnerError<Self::Error>> {
 		let measured_proof_size_before = get_proof_size().unwrap_or_default();
 
+		Pallet::<T>::ensure_authorization_list_size(&authorization_list, || {
+			T::FeeCalculator::min_gas_price().1
+		})?;
+
 		let authorization_list = authorization_list
 			.iter()
 			.map(|d| {
@@ -634,6 +638,8 @@ where
 	) -> Result<CreateInfo, RunnerError<Self::Error>> {
 		let measured_proof_size_before = get_proof_size().unwrap_or_default();
 		let (_, weight) = T::FeeCalculator::min_gas_price();
+
+		Pallet::<T>::ensure_authorization_list_size(&authorization_list, || weight)?;
 
 		T::CreateOriginFilter::check_create_origin(&source)
 			.map_err(|error| RunnerError { error, weight })?;
@@ -717,6 +723,8 @@ where
 	) -> Result<CreateInfo, RunnerError<Self::Error>> {
 		let measured_proof_size_before = get_proof_size().unwrap_or_default();
 		let (_, weight) = T::FeeCalculator::min_gas_price();
+
+		Pallet::<T>::ensure_authorization_list_size(&authorization_list, || weight)?;
 
 		T::CreateOriginFilter::check_create_origin(&source)
 			.map_err(|error| RunnerError { error, weight })?;
@@ -806,6 +814,8 @@ where
 	) -> Result<CreateInfo, RunnerError<Self::Error>> {
 		let measured_proof_size_before = get_proof_size().unwrap_or_default();
 		let (_, weight) = T::FeeCalculator::min_gas_price();
+
+		Pallet::<T>::ensure_authorization_list_size(&authorization_list, || weight)?;
 
 		T::CreateOriginFilter::check_create_origin(&source)
 			.map_err(|error| RunnerError { error, weight })?;

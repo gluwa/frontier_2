@@ -102,13 +102,13 @@ use sp_runtime::{
 };
 // Frontier
 use fp_account::AccountId20;
-use fp_evm::GenesisAccount;
 pub use fp_evm::{
 	Account, AccountProvider, CallInfo, CreateInfo, ExecutionInfoV2 as ExecutionInfo,
 	FeeCalculator, IsPrecompileResult, LinearCostPrecompile, Log, Precompile, PrecompileFailure,
 	PrecompileHandle, PrecompileOutput, PrecompileResult, PrecompileSet,
 	TransactionValidationError, Vicinity, EVM_CONFIG,
 };
+use fp_evm::{GenesisAccount, MAX_AUTHORIZATION_LIST_SIZE};
 
 pub use self::{
 	pallet::*,
@@ -330,6 +330,18 @@ pub mod pallet {
 			authorization_list: AuthorizationList,
 		) -> DispatchResultWithPostInfo {
 			T::CallOrigin::ensure_address_origin(&source, origin)?;
+
+			// Must precede `encoded_size`, which traverses the whole authorization list.
+			Self::ensure_authorization_list_size(&authorization_list, || {
+				T::FeeCalculator::min_gas_price().1
+			})
+			.map_err(|e| DispatchErrorWithPostInfo {
+				post_info: PostDispatchInfo {
+					actual_weight: Some(e.weight),
+					pays_fee: Pays::Yes,
+				},
+				error: e.error.into(),
+			})?;
 
 			let (weight_limit, proof_size_base_cost) = Self::call_weight_limits(
 				gas_limit,
@@ -631,6 +643,8 @@ pub mod pallet {
 		Undefined,
 		/// Address not allowed to deploy contracts either via CREATE or CALL(CREATE).
 		CreateOriginNotAllowed,
+		/// The EIP-7702 authorization list exceeds the maximum number of entries.
+		AuthorizationListTooLarge,
 	}
 
 	impl<T> From<TransactionValidationError> for Error<T> {
@@ -647,7 +661,9 @@ pub mod pallet {
 				TransactionValidationError::InvalidChainId => Error::<T>::InvalidChainId,
 				TransactionValidationError::InvalidSignature => Error::<T>::InvalidSignature,
 				TransactionValidationError::EmptyAuthorizationList => Error::<T>::Undefined,
-				TransactionValidationError::AuthorizationListTooLarge => Error::<T>::Undefined,
+				TransactionValidationError::AuthorizationListTooLarge => {
+					Error::<T>::AuthorizationListTooLarge
+				}
 				TransactionValidationError::InvalidAuthorizationCreate => Error::<T>::Undefined,
 				TransactionValidationError::UnknownError => Error::<T>::Undefined,
 			}
@@ -984,6 +1000,28 @@ impl<T: Config> Pallet<T> {
 			),
 			_ => (None, None),
 		}
+	}
+
+	/// Reject an authorization list longer than `MAX_AUTHORIZATION_LIST_SIZE`.
+	///
+	/// This must run before any per-entry work (traversal, signer recovery, allocation, cloning)
+	/// and applies to every entry point, including non-transactional runtime API calls, so that
+	/// the preprocessing cost of a request is bounded regardless of `validate`.
+	///
+	/// `weight` is only evaluated when the list is rejected, and is the weight reported for the
+	/// rejection. Callers that have already queried the fee calculator can pass that weight to
+	/// avoid querying it twice.
+	pub(crate) fn ensure_authorization_list_size(
+		authorization_list: &AuthorizationList,
+		weight: impl FnOnce() -> Weight,
+	) -> Result<(), RunnerError<Error<T>>> {
+		if authorization_list.len() > MAX_AUTHORIZATION_LIST_SIZE {
+			return Err(RunnerError {
+				error: Error::<T>::AuthorizationListTooLarge,
+				weight: weight(),
+			});
+		}
+		Ok(())
 	}
 
 	/// Check whether an account is empty.
