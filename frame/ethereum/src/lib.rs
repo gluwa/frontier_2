@@ -623,8 +623,14 @@ impl<T: Config> Pallet<T> {
 
 	/// Extract the `Executed` event extra data from the return data of a reverted call.
 	///
-	/// The result never exceeds `T::ExtraDataLength` bytes: canonical ABI `Error(string)`
-	/// payloads yield the (capped) message, anything else yields a capped prefix of the raw data.
+	/// The result never exceeds `T::ExtraDataLength` bytes.
+	///
+	/// - A canonical ABI `Error(string)` payload (selector and offset validated) yields its
+	///   message, capped at `ExtraDataLength`. The declared length is capped before it is checked
+	///   against the data, so a payload declaring more than the cap still yields the message
+	///   bytes it carries, up to the cap.
+	/// - Anything else, including payloads too short to cover the capped message, yields a capped
+	///   prefix of the raw data.
 	fn revert_extra_data(data: Vec<u8>) -> Vec<u8> {
 		// `Error(string)` selector.
 		const ERROR_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
@@ -647,7 +653,8 @@ impl<T: Config> Pallet<T> {
 			}
 		}
 
-		// Not a canonical `Error(string)`: return a bounded prefix of the raw data.
+		// Not a canonical `Error(string)`, or too short for its capped range: return a bounded
+		// prefix of the raw data.
 		let mut data = data;
 		data.truncate(cap);
 		data
