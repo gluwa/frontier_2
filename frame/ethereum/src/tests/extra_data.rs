@@ -56,8 +56,8 @@ fn short_message_is_returned_in_full() {
 #[test]
 fn truncated_payload_with_oversized_declaration_is_capped() {
 	// Declared length >= cap, but returndata is cut just below `68 + cap` bytes.
-	let message = vec![b'a'; CAP - 1];
-	let data = error_payload(CAP, &message);
+	let message = &[b'a'; CAP - 1];
+	let data = error_payload(CAP, message);
 	assert_eq!(data.len(), 68 + CAP - 1);
 	let out = Ethereum::revert_extra_data(data);
 	assert!(out.len() <= CAP);
@@ -65,7 +65,7 @@ fn truncated_payload_with_oversized_declaration_is_capped() {
 
 #[test]
 fn huge_declared_length_is_capped() {
-	let data = error_payload(usize::MAX, &vec![b'a'; CAP - 1]);
+	let data = error_payload(usize::MAX, &[b'a'; CAP - 1]);
 	assert!(Ethereum::revert_extra_data(data).len() <= CAP);
 }
 
@@ -99,7 +99,7 @@ fn non_canonical_offset_returns_raw_prefix() {
 
 #[test]
 fn truncated_payload_returns_raw_prefix() {
-	let data = error_payload(CAP, &vec![b'a'; CAP - 1]);
+	let data = error_payload(CAP, &[b'a'; CAP - 1]);
 	assert_eq!(
 		Ethereum::revert_extra_data(data.clone()),
 		data[..CAP].to_vec()

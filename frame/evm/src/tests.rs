@@ -2138,7 +2138,11 @@ mod gasprice_test {
 				"test is only meaningful with a nonzero realized priority fee"
 			);
 
-			let expected = [effective_gas_price.to_big_endian(), base_fee.to_big_endian()].concat();
+			let expected = [
+				effective_gas_price.to_big_endian(),
+				base_fee.to_big_endian(),
+			]
+			.concat();
 
 			assert_eq!(call_result.value, expected);
 		});
@@ -2217,7 +2221,11 @@ mod gasprice_test {
 				"test is only meaningful with a nonzero realized priority fee"
 			);
 
-			let expected = [effective_gas_price.to_big_endian(), base_fee.to_big_endian()].concat();
+			let expected = [
+				effective_gas_price.to_big_endian(),
+				base_fee.to_big_endian(),
+			]
+			.concat();
 
 			assert_eq!(call_result.value, expected);
 		});
@@ -2231,9 +2239,8 @@ mod gasprice_test {
 			let max_fee_per_gas = U256::from(2_000_000_000u128);
 
 			let contract_addr = deploy(max_fee_per_gas, gas_limit);
-			let call_result =
-				call_contract_non_transactional(contract_addr, None, None, gas_limit)
-					.expect("non-transactional call should succeed");
+			let call_result = call_contract_non_transactional(contract_addr, None, None, gas_limit)
+				.expect("non-transactional call should succeed");
 			assert_eq!(
 				call_result.exit_reason,
 				crate::ExitReason::Succeed(ExitSucceed::Returned)

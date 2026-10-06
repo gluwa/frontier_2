@@ -689,11 +689,11 @@ where
 		} && request
 			.access_list
 			.as_ref()
-			.map_or(true, |list| list.is_empty())
+			.is_none_or(|list| list.is_empty())
 			&& request
 				.authorization_list
 				.as_ref()
-				.map_or(true, |list| list.is_empty());
+				.is_none_or(|list| list.is_empty());
 		if is_simple_transfer {
 			if let Some(to) = request.to {
 				// Registered precompiles execute and charge gas despite having no ordinary
