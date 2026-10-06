@@ -72,7 +72,7 @@ fn blockhash_opcode_does_not_expose_retained_genesis_hash() {
 
 		// Store the genesis block like the pallet genesis build does, then produce more blocks
 		// than the BlockHash pruning window.
-		Ethereum::store_block(None, U256::zero());
+		Ethereum::store_block(false, None, U256::zero());
 		let genesis_hash = BlockHash::<Test>::get(U256::zero());
 		assert_ne!(genesis_hash, H256::zero());
 		for number in 1..=300u64 {
@@ -120,7 +120,7 @@ fn blockhash_opcode_returns_genesis_hash_within_window() {
 	ext.execute_with(|| {
 		let contract_addr = deploy_blockhash_contract();
 
-		Ethereum::store_block(None, U256::zero());
+		Ethereum::store_block(false, None, U256::zero());
 		let genesis_hash = BlockHash::<Test>::get(U256::zero());
 		assert_ne!(genesis_hash, H256::zero());
 		for number in 1..=100u64 {
