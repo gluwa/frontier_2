@@ -2645,3 +2645,199 @@ mod authorization_list_size_test {
 		});
 	}
 }
+
+mod delegation_accounting_test {
+	use super::*;
+	use ethereum::{eip2930::MalleableTransactionSignature, AuthorizationListItem};
+	use fp_evm::{
+		CallInfo, ACCOUNT_CODES_KEY_SIZE, ACCOUNT_CODES_METADATA_PROOF_SIZE, WRITE_PROOF_SIZE,
+	};
+	use sp_core::{ecdsa, Pair};
+
+	// `0xef0100 || address`.
+	const DELEGATION_SIZE: u64 = 23;
+	const GAS_LIMIT: u64 = 1_000_000;
+
+	fn authority_pair(index: u8) -> ecdsa::Pair {
+		ecdsa::Pair::from_seed(&[index + 1; 32])
+	}
+
+	fn delegate(index: u8) -> H160 {
+		H160::from([index + 0x10; 20])
+	}
+
+	fn delegation_code(delegate: H160) -> Vec<u8> {
+		[&[0xef, 0x01, 0x00][..], delegate.as_bytes()].concat()
+	}
+
+	/// Signs an authorization and returns it together with the address of the authority.
+	fn authorize(pair: &ecdsa::Pair, delegate: H160, nonce: u64) -> (AuthorizationListItem, H160) {
+		let mut item = AuthorizationListItem {
+			chain_id: 0,
+			address: delegate,
+			nonce: U256::from(nonce),
+			signature: MalleableTransactionSignature {
+				odd_y_parity: false,
+				r: H256::zero(),
+				s: H256::zero(),
+			},
+		};
+		let signature = pair.sign_prehashed(&item.authorization_message_hash().0);
+		let bytes: &[u8] = signature.as_ref();
+		item.signature = MalleableTransactionSignature {
+			odd_y_parity: bytes[64] != 0,
+			r: H256::from_slice(&bytes[0..32]),
+			s: H256::from_slice(&bytes[32..64]),
+		};
+		let authority = item.authorizing_address().expect("valid signature");
+		(item, authority)
+	}
+
+	fn transact(authorization_list: AuthorizationList) -> CallInfo {
+		let info = <Test as Config>::Runner::call(
+			H160::default(),
+			H160::from_low_u64_be(0x1234),
+			Vec::new(),
+			U256::zero(),
+			GAS_LIMIT,
+			Some(FixedGasPrice::min_gas_price().0),
+			None,
+			None,
+			Vec::new(),
+			authorization_list,
+			true, // transactional
+			true, // must be validated
+			Some(FixedGasWeightMapping::<Test>::gas_to_weight(GAS_LIMIT, true)),
+			Some(0),
+			<Test as Config>::config(),
+		)
+		.expect("call succeeds");
+		assert_eq!(info.exit_reason, ExitReason::Succeed(ExitSucceed::Stopped));
+		info
+	}
+
+	/// Storage growth gas of installing `count` delegations on accounts without code.
+	fn installation_storage_gas(count: u64) -> u64 {
+		let ratio = <<Test as Config>::GasLimitStorageGrowthRatio as Get<u64>>::get();
+		(ACCOUNT_CODES_KEY_SIZE + ACCOUNT_CODES_METADATA_PROOF_SIZE + DELEGATION_SIZE)
+			* count * ratio
+	}
+
+	fn proof_size_usage(info: &CallInfo) -> u64 {
+		info.weight_info
+			.expect("weight info")
+			.proof_size_usage
+			.expect("proof size usage")
+	}
+
+	#[test]
+	fn first_installation_charges_storage_growth() {
+		new_test_ext().execute_with(|| {
+			let (auth, authority) = authorize(&authority_pair(0), delegate(0), 0);
+
+			let info = transact(vec![auth]);
+
+			assert_eq!(
+				AccountCodes::<Test>::get(authority),
+				delegation_code(delegate(0))
+			);
+			assert_eq!(
+				info.used_gas.effective.as_u64(),
+				installation_storage_gas(1)
+			);
+		});
+	}
+
+	#[test]
+	fn replacing_a_delegation_does_not_charge_storage_growth() {
+		new_test_ext().execute_with(|| {
+			let pair = authority_pair(0);
+			let (first, authority) = authorize(&pair, delegate(0), 0);
+			transact(vec![first]);
+
+			let (second, _) = authorize(&pair, delegate(1), 1);
+			let info = transact(vec![second]);
+
+			assert_eq!(
+				AccountCodes::<Test>::get(authority),
+				delegation_code(delegate(1))
+			);
+			// Only ordinary gas is charged; neither storage nor proof size dominates.
+			assert_eq!(info.used_gas.effective, info.used_gas.standard);
+			assert!(info.used_gas.effective.as_u64() < installation_storage_gas(1));
+		});
+	}
+
+	#[test]
+	fn replacing_many_delegations_does_not_charge_storage_growth() {
+		new_test_ext().execute_with(|| {
+			let pairs: Vec<_> = (0..8).map(authority_pair).collect();
+
+			let installs = pairs
+				.iter()
+				.map(|pair| authorize(pair, delegate(0), 0).0)
+				.collect();
+			let info = transact(installs);
+			assert_eq!(
+				info.used_gas.effective.as_u64(),
+				installation_storage_gas(8)
+			);
+
+			let replacements = pairs
+				.iter()
+				.map(|pair| authorize(pair, delegate(1), 1).0)
+				.collect();
+			let info = transact(replacements);
+			assert_eq!(info.used_gas.effective, info.used_gas.standard);
+			assert!(info.used_gas.effective.as_u64() < installation_storage_gas(8));
+		});
+	}
+
+	#[test]
+	fn reinstalling_after_a_reset_charges_storage_growth_again() {
+		new_test_ext().execute_with(|| {
+			let pair = authority_pair(0);
+			let (install, authority) = authorize(&pair, delegate(0), 0);
+			transact(vec![install]);
+
+			let (reset, _) = authorize(&pair, H160::zero(), 1);
+			let info = transact(vec![reset]);
+			assert!(!AccountCodes::<Test>::contains_key(authority));
+			// Removing the delegation does not earn a storage credit.
+			assert_eq!(info.used_gas.effective, info.used_gas.standard);
+
+			let (reinstall, _) = authorize(&pair, delegate(1), 2);
+			let info = transact(vec![reinstall]);
+			assert_eq!(
+				AccountCodes::<Test>::get(authority),
+				delegation_code(delegate(1))
+			);
+			assert_eq!(
+				info.used_gas.effective.as_u64(),
+				installation_storage_gas(1)
+			);
+		});
+	}
+
+	#[test]
+	fn reset_records_the_same_write_proof_size_as_replacement() {
+		new_test_ext().execute_with(|| {
+			let replaced = authority_pair(0);
+			let cleared = authority_pair(1);
+			let installs = [&replaced, &cleared]
+				.iter()
+				.map(|pair| authorize(pair, delegate(0), 0).0)
+				.collect();
+			transact(installs);
+
+			let (replacement, _) = authorize(&replaced, delegate(1), 1);
+			let replacement = transact(vec![replacement]);
+			let (reset, authority) = authorize(&cleared, H160::zero(), 1);
+			let reset = transact(vec![reset]);
+
+			assert!(!AccountCodes::<Test>::contains_key(authority));
+			assert!(proof_size_usage(&reset) >= WRITE_PROOF_SIZE);
+			assert_eq!(proof_size_usage(&reset), proof_size_usage(&replacement));
+		});
+	}
+}
