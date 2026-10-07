@@ -1319,12 +1319,18 @@ where
 		}
 
 		if let Some(storage_meter) = self.storage_meter.as_mut() {
-			let storage_growth = ACCOUNT_CODES_KEY_SIZE
-				.saturating_add(ACCOUNT_CODES_METADATA_PROOF_SIZE)
-				.saturating_add(code_len);
-			storage_meter
-				.record(storage_growth)
-				.map_err(|_| ExitError::OutOfGas)?;
+			// Replacing a delegation reuses the existing code and metadata entries, which are
+			// always the same size, so only an authority without code grows storage. Removing
+			// a delegation is never credited back, so a reset followed by a reinstall is
+			// charged in full.
+			if !<AccountCodes<T>>::contains_key(authority) {
+				let storage_growth = ACCOUNT_CODES_KEY_SIZE
+					.saturating_add(ACCOUNT_CODES_METADATA_PROOF_SIZE)
+					.saturating_add(code_len);
+				storage_meter
+					.record(storage_growth)
+					.map_err(|_| ExitError::OutOfGas)?;
+			}
 		}
 
 		let meta = crate::CodeMetadata::from_code(&code);
@@ -1338,6 +1344,10 @@ where
 			target: "evm",
 			"Resetting delegation at {address:?}"
 		);
+
+		if let Some(weight_info) = self.weight_info.as_mut() {
+			weight_info.try_record_proof_size_or_fail(WRITE_PROOF_SIZE)?;
+		}
 
 		Pallet::<T>::remove_account_code(&address);
 		Ok(())
