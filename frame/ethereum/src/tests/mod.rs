@@ -33,6 +33,7 @@ mod blockhash;
 mod eip1559;
 mod eip2930;
 mod eip7702;
+mod extra_data;
 mod legacy;
 mod pre_log;
 

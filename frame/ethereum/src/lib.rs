@@ -675,6 +675,45 @@ impl<T: Config> Pallet<T> {
 		builder.build()
 	}
 
+	/// Extract the `Executed` event extra data from the return data of a reverted call.
+	///
+	/// The result never exceeds `T::ExtraDataLength` bytes.
+	///
+	/// - A canonical ABI `Error(string)` payload (selector and offset validated) yields its
+	///   message, capped at `ExtraDataLength`. The declared length is capped before it is checked
+	///   against the data, so a payload declaring more than the cap still yields the message
+	///   bytes it carries, up to the cap.
+	/// - Anything else, including payloads too short to cover the capped message, yields a capped
+	///   prefix of the raw data.
+	fn revert_extra_data(data: Vec<u8>) -> Vec<u8> {
+		// `Error(string)` selector.
+		const ERROR_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+		const OFFSET_START: usize = 4;
+		const LEN_START: usize = 36;
+		const MESSAGE_START: usize = 68;
+
+		let cap = T::ExtraDataLength::get() as usize;
+
+		if data.len() >= MESSAGE_START
+			&& data[..OFFSET_START] == ERROR_SELECTOR
+			&& U256::from_big_endian(&data[OFFSET_START..LEN_START]) == U256::from(32)
+		{
+			let message_len =
+				U256::from_big_endian(&data[LEN_START..MESSAGE_START]).saturated_into::<usize>();
+			let message_end = MESSAGE_START.saturating_add(message_len.min(cap));
+
+			if data.len() >= message_end {
+				return data[MESSAGE_START..message_end].to_vec();
+			}
+		}
+
+		// Not a canonical `Error(string)`, or too short for its capped range: return a bounded
+		// prefix of the raw data.
+		let mut data = data;
+		data.truncate(cap);
+		data
+	}
+
 	fn apply_validated_transaction(
 		source: H160,
 		transaction: Transaction,
@@ -705,29 +744,7 @@ impl<T: Config> Pallet<T> {
 				info.used_gas,
 				to,
 				match info.exit_reason {
-					ExitReason::Revert(_) => {
-						const LEN_START: usize = 36;
-						const MESSAGE_START: usize = 68;
-
-						let data = info.value;
-						let data_len = data.len();
-						if data_len > MESSAGE_START {
-							let message_len =
-								U256::from_big_endian(&data[LEN_START..MESSAGE_START])
-									.saturated_into::<usize>();
-							let message_end = MESSAGE_START.saturating_add(
-								message_len.min(T::ExtraDataLength::get() as usize),
-							);
-
-							if data_len >= message_end {
-								data[MESSAGE_START..message_end].to_vec()
-							} else {
-								data
-							}
-						} else {
-							data
-						}
-					}
+					ExitReason::Revert(_) => Self::revert_extra_data(info.value),
 					_ => vec![],
 				},
 			),
