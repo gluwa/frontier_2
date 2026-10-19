@@ -42,6 +42,105 @@ use fp_rpc::{EthereumRuntimeRPCApi, TransactionStatus};
 
 use crate::{cache::EthBlockDataCacheTask, frontier_backend_client, internal_err};
 
+/// Maximum number of addresses a log filter may match on.
+const MAX_FILTER_ADDRESSES: usize = 1024;
+/// Maximum number of alternatives a single log filter topic position may hold.
+const MAX_FILTER_TOPIC_OPTIONS: usize = 1024;
+/// Default budget for a single filter poll response, matching the RPC server's default
+/// maximum response size (15 MiB).
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 15 * 1024 * 1024;
+/// Upper bound on the serialized size of one block or transaction hash in a response.
+const HASH_JSON_BYTES: usize = 70;
+
+fn variadic_len<T: sp_runtime::DeserializeOwned>(value: &VariadicValue<T>) -> usize {
+	match value {
+		VariadicValue::Single(_) => 1,
+		VariadicValue::Multiple(items) => items.len(),
+		_ => 0,
+	}
+}
+
+/// Rejects log filters whose address or topic lists exceed the configured limits.
+fn validate_filter_size(filter: &Filter) -> RpcResult<()> {
+	if filter.address.as_ref().map_or(0, variadic_len) > MAX_FILTER_ADDRESSES {
+		return Err(internal_err(format!(
+			"too many filter addresses (maximum {MAX_FILTER_ADDRESSES})"
+		)));
+	}
+	if filter
+		.topics()
+		.iter()
+		.any(|topic| variadic_len(topic) > MAX_FILTER_TOPIC_OPTIONS)
+	{
+		return Err(internal_err(format!(
+			"too many filter topic options (maximum {MAX_FILTER_TOPIC_OPTIONS})"
+		)));
+	}
+	Ok(())
+}
+
+/// Rejects block-hash log queries whose result exceeds `max_past_logs`, matching range queries.
+fn ensure_within_max_past_logs(logs: &[Log], max_past_logs: u32) -> RpcResult<()> {
+	if logs.len() > max_past_logs as usize {
+		return Err(internal_err(format!(
+			"query returned more than {max_past_logs} results"
+		)));
+	}
+	Ok(())
+}
+
+/// Upper bound on the JSON-serialized size of a log: fixed fields plus its topics and data.
+fn log_json_bytes(log: &Log) -> usize {
+	512usize
+		.saturating_add(log.topics.len().saturating_mul(HASH_JSON_BYTES))
+		.saturating_add(log.data.0.len().saturating_mul(2))
+}
+
+/// Trims a poll's logs, which must be ordered by block number, to whole blocks fitting
+/// `max_bytes`.
+///
+/// Returns the retained logs and, if any were dropped, the first block number left out, so the
+/// cursor can stop there and the next poll picks those blocks up. Fails if the first block
+/// alone does not fit, as no progress can be made.
+fn cap_logs_to_response_size(
+	mut logs: Vec<Log>,
+	max_bytes: usize,
+) -> RpcResult<(Vec<Log>, Option<u64>)> {
+	let mut total = 0usize;
+	let mut cutoff = None;
+	for log in &logs {
+		total = total.saturating_add(log_json_bytes(log));
+		if total > max_bytes {
+			cutoff = Some(log.block_number.unwrap_or_default().low_u64());
+			break;
+		}
+	}
+	let Some(cutoff) = cutoff else {
+		return Ok((logs, None));
+	};
+	logs.retain(|log| log.block_number.unwrap_or_default().low_u64() < cutoff);
+	if logs.is_empty() {
+		return Err(internal_err(format!(
+			"logs of block {cutoff} exceed the maximum response size of {max_bytes} bytes"
+		)));
+	}
+	Ok((logs, Some(cutoff)))
+}
+
+/// Moves a filter's poll cursor forward to `next`, once its changes were retrieved.
+///
+/// The cursor never moves backwards, so concurrent polls of the same filter cannot rewind it.
+fn advance_filter_cursor(filter_pool: &FilterPool, key: U256, next: u64) {
+	if let Ok(mut locked) = filter_pool.lock() {
+		if let Some(item) = locked.get_mut(&key) {
+			let current = item.last_poll.to_min_block_num().unwrap_or_default();
+			if next > current {
+				item.last_poll = BlockNumberOrHash::Num(next);
+			}
+		}
+	}
+}
+
 pub struct EthFilter<B: BlockT, C, BE, P> {
 	client: Arc<C>,
 	backend: Arc<dyn fc_api::Backend<B>>,
@@ -50,6 +149,7 @@ pub struct EthFilter<B: BlockT, C, BE, P> {
 	max_stored_filters: usize,
 	max_past_logs: u32,
 	max_block_range: u32,
+	max_response_bytes: usize,
 	block_data_cache: Arc<EthBlockDataCacheTask<B>>,
 	_marker: PhantomData<BE>,
 }
@@ -73,9 +173,17 @@ impl<B: BlockT, C, BE, P: TransactionPool> EthFilter<B, C, BE, P> {
 			max_stored_filters,
 			max_past_logs,
 			max_block_range,
+			max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
 			block_data_cache,
 			_marker: PhantomData,
 		}
+	}
+
+	/// Sets the response size budget for filter polls. Should match the RPC server's maximum
+	/// response size, so an oversized poll is trimmed instead of rejected after its cursor moved.
+	pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+		self.max_response_bytes = max_response_bytes;
+		self
 	}
 }
 
@@ -94,6 +202,7 @@ where
 		// Reject Log filters whose block range exceeds `max_block_range`, mirroring the
 		// `eth_getLogs` cap so it cannot be bypassed via the filter API (upstream #1824).
 		if let FilterType::Log(ref filter) = filter_type {
+			validate_filter_size(filter)?;
 			let from_number = filter
 				.from_block
 				.and_then(|v| v.to_min_block_num())
@@ -119,15 +228,6 @@ where
 					self.max_stored_filters
 				)));
 			}
-			let next_back = {
-				let mut iter = locked.iter();
-				iter.next_back()
-			};
-			let last_key = match next_back {
-				Some((k, _)) => *k,
-				None => U256::zero(),
-			};
-
 			let pending_transaction_hashes = if let FilterType::PendingTransaction = filter_type {
 				let txs_ready = self
 					.pool
@@ -147,8 +247,14 @@ where
 				HashSet::new()
 			};
 
-			// Assume `max_stored_filters` is always < U256::max.
-			let key = last_key.checked_add(U256::one()).unwrap();
+			// Random, non-zero identifiers that fit the `Index` (usize) used by the filter
+			// methods, so an identifier reveals nothing about other filters.
+			let key = loop {
+				let candidate = U256::from(rand::random::<u64>() as usize);
+				if !candidate.is_zero() && !locked.contains_key(&candidate) {
+					break candidate;
+				}
+			};
 			locked.insert(
 				key,
 				FilterPoolItem {
@@ -209,6 +315,7 @@ where
 				filter: Filter,
 				from_number: NumberFor<B>,
 				current_number: NumberFor<B>,
+				next: u64,
 			},
 			Error(jsonrpsee::types::ErrorObjectOwned),
 		}
@@ -224,19 +331,18 @@ where
 			if let Some(pool_item) = locked.get(&key).cloned() {
 				match &pool_item.filter_type {
 					// For each block created since last poll, get a vector of ethereum hashes.
+					// At most `max_block_range` blocks are returned per poll; the cursor is only
+					// advanced once they were retrieved, so a lagging client catches up over
+					// several polls without skipping any block.
 					FilterType::Block => {
-						let last = pool_item.last_poll.to_min_block_num().unwrap();
-						let next = best_number + 1;
-						// Update filter `last_poll`.
-						locked.insert(
-							key,
-							FilterPoolItem {
-								last_poll: BlockNumberOrHash::Num(next),
-								filter_type: pool_item.filter_type.clone(),
-								at_block: pool_item.at_block,
-								pending_transaction_hashes: HashSet::new(),
-							},
+						let last = pool_item.last_poll.to_min_block_num().unwrap_or_default();
+						let range_end = last
+							.saturating_add(u64::from(self.max_block_range))
+							.saturating_add(1);
+						let size_end = last.saturating_add(
+							(self.max_response_bytes / HASH_JSON_BYTES).max(1) as u64,
 						);
+						let next = best_number.saturating_add(1).min(range_end).min(size_end);
 
 						FuturePath::<B>::Block { last, next }
 					}
@@ -277,18 +383,8 @@ where
 						}
 					}
 					// For each event since last poll, get a vector of ethereum logs.
+					// Same bounding and cursor rules as block filters.
 					FilterType::Log(filter) => {
-						// Update filter `last_poll`.
-						locked.insert(
-							key,
-							FilterPoolItem {
-								last_poll: BlockNumberOrHash::Num(best_number + 1),
-								filter_type: pool_item.filter_type.clone(),
-								at_block: pool_item.at_block,
-								pending_transaction_hashes: HashSet::new(),
-							},
-						);
-
 						// Either the filter-specific `to` block or best block.
 						let best_number = self.client.info().best_number;
 						let mut current_number = filter
@@ -302,10 +398,10 @@ where
 						}
 
 						// The from clause is the max(last_poll, filter_from).
-						let last_poll = pool_item
+						let last_poll: NumberFor<B> = pool_item
 							.last_poll
 							.to_min_block_num()
-							.unwrap()
+							.unwrap_or_default()
 							.unique_saturated_into();
 
 						let filter_from = filter
@@ -315,12 +411,21 @@ where
 							.unwrap_or(last_poll);
 
 						let from_number = std::cmp::max(last_poll, filter_from);
+						let range_end =
+							from_number.saturating_add(NumberFor::<B>::from(self.max_block_range));
+						if current_number > range_end {
+							current_number = range_end;
+						}
+						let next =
+							UniqueSaturatedInto::<u64>::unique_saturated_into(current_number)
+								.saturating_add(1);
 
 						// Build the response.
 						FuturePath::Log {
 							filter: filter.clone(),
 							from_number,
 							current_number,
+							next,
 						}
 					}
 				}
@@ -335,6 +440,7 @@ where
 		let backend = Arc::clone(&self.backend);
 		let block_data_cache = Arc::clone(&self.block_data_cache);
 		let max_past_logs = self.max_past_logs;
+		let max_response_bytes = self.max_response_bytes;
 
 		match path {
 			FuturePath::Error(err) => Err(err),
@@ -346,11 +452,16 @@ where
 						.expect_block_hash_from_id(&id)
 						.map_err(|_| internal_err(format!("Expect block number from id: {id}")))?;
 
-					let block = block_data_cache.current_block(substrate_hash).await;
-					if let Some(block) = block {
-						ethereum_hashes.push(block.header.hash())
-					}
+					// Fail rather than skip, so the cursor stays put and the block is retried.
+					let block = block_data_cache
+						.current_block(substrate_hash)
+						.await
+						.ok_or_else(|| {
+							internal_err(format!("block data unavailable for block {n}"))
+						})?;
+					ethereum_hashes.push(block.header.hash());
 				}
+				advance_filter_cursor(&pool, key, next);
 				Ok(FilterChanges::Hashes(ethereum_hashes))
 			}
 			FuturePath::PendingTransaction { new_hashes } => Ok(FilterChanges::Hashes(new_hashes)),
@@ -358,6 +469,7 @@ where
 				filter,
 				from_number,
 				current_number,
+				next,
 			} => {
 				let logs = if backend.is_indexed() {
 					filter_range_logs_indexed(
@@ -368,6 +480,7 @@ where
 						&filter,
 						from_number,
 						current_number,
+						true,
 					)
 					.await?
 				} else {
@@ -378,10 +491,13 @@ where
 						&filter,
 						from_number,
 						current_number,
+						true,
 					)
 					.await?
 				};
 
+				let (logs, cutoff) = cap_logs_to_response_size(logs, max_response_bytes)?;
+				advance_filter_cursor(&pool, key, cutoff.unwrap_or(next));
 				Ok(FilterChanges::Logs(logs))
 			}
 		}
@@ -450,6 +566,7 @@ where
 				&filter,
 				from_number,
 				current_number,
+				false,
 			)
 			.await?
 		} else {
@@ -460,6 +577,7 @@ where
 				&filter,
 				from_number,
 				current_number,
+				false,
 			)
 			.await?
 		};
@@ -483,6 +601,7 @@ where
 	}
 
 	async fn logs(&self, filter: Filter) -> RpcResult<Vec<Log>> {
+		validate_filter_size(&filter)?;
 		let client = Arc::clone(&self.client);
 		let block_data_cache = Arc::clone(&self.block_data_cache);
 		let backend = Arc::clone(&self.backend);
@@ -508,6 +627,7 @@ where
 				.await;
 			if let (Some(block), Some(statuses)) = (block, statuses) {
 				logs = filter_block_logs(&filter, block, statuses);
+				ensure_within_max_past_logs(&logs, max_past_logs)?;
 			}
 		} else {
 			let best_number = client.info().best_number;
@@ -544,6 +664,7 @@ where
 					&filter,
 					from_number,
 					current_number,
+					false,
 				)
 				.await?
 			} else {
@@ -554,6 +675,7 @@ where
 					&filter,
 					from_number,
 					current_number,
+					false,
 				)
 				.await?
 			};
@@ -570,6 +692,7 @@ async fn filter_range_logs_indexed<B, C, BE>(
 	filter: &Filter,
 	from: NumberFor<B>,
 	to: NumberFor<B>,
+	require_block_data: bool,
 ) -> RpcResult<Vec<Log>>
 where
 	B: BlockT,
@@ -605,15 +728,16 @@ where
 	let timer_fetch = Instant::now();
 
 	let mut logs_to_return = Vec::new();
-	if let Ok(logs) = backend
-		.filter_logs(
-			UniqueSaturatedInto::<u64>::unique_saturated_into(from),
-			UniqueSaturatedInto::<u64>::unique_saturated_into(to),
-			addresses,
-			topics,
-		)
-		.await
 	{
+		let logs = backend
+			.filter_logs(
+				UniqueSaturatedInto::<u64>::unique_saturated_into(from),
+				UniqueSaturatedInto::<u64>::unique_saturated_into(to),
+				addresses,
+				topics,
+			)
+			.await
+			.map_err(|err| internal_err(format!("log query failed: {err}")))?;
 		let time_fetch = timer_fetch.elapsed().as_millis();
 		let timer_post = Instant::now();
 
@@ -636,6 +760,11 @@ where
 				statuses_cache.insert(log.substrate_block_hash, statuses.clone());
 				statuses
 			};
+			if statuses.is_none() && require_block_data {
+				return Err(internal_err(format!(
+					"block data unavailable for block {block_number}"
+				)));
+			}
 			if let Some(statuses) = statuses {
 				let mut block_log_index: u32 = 0;
 				for status in statuses.iter() {
@@ -703,6 +832,7 @@ async fn filter_range_logs<B, C, BE>(
 	filter: &Filter,
 	from: NumberFor<B>,
 	to: NumberFor<B>,
+	require_block_data: bool,
 ) -> RpcResult<Vec<Log>>
 where
 	B: BlockT,
@@ -729,6 +859,11 @@ where
 			.map_err(|_| internal_err(format!("Expect block number from id: {id}")))?;
 
 		let block = block_data_cache.current_block(substrate_hash).await;
+		if block.is_none() && require_block_data {
+			return Err(internal_err(format!(
+				"block data unavailable for block {id}"
+			)));
+		}
 
 		if let Some(block) = block {
 			if FilteredParams::address_in_bloom(block.header.logs_bloom, &address_bloom_filter)
@@ -737,8 +872,14 @@ where
 				let statuses = block_data_cache
 					.current_transaction_statuses(substrate_hash)
 					.await;
-				if let Some(statuses) = statuses {
-					logs.extend(filter_block_logs(filter, block, statuses));
+				match statuses {
+					Some(statuses) => logs.extend(filter_block_logs(filter, block, statuses)),
+					None if require_block_data => {
+						return Err(internal_err(format!(
+							"block data unavailable for block {id}"
+						)));
+					}
+					None => {}
 				}
 			}
 		}
@@ -809,4 +950,141 @@ pub(crate) fn filter_block_logs(
 		}
 	}
 	logs
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use ethereum_types::H160;
+	use std::sync::Mutex;
+
+	fn pool_with(key: U256, last_poll: u64) -> FilterPool {
+		let pool: FilterPool = Arc::new(Mutex::new(BTreeMap::new()));
+		pool.lock().unwrap().insert(
+			key,
+			FilterPoolItem {
+				last_poll: BlockNumberOrHash::Num(last_poll),
+				filter_type: FilterType::Block,
+				at_block: last_poll,
+				pending_transaction_hashes: HashSet::new(),
+			},
+		);
+		pool
+	}
+
+	fn last_poll(pool: &FilterPool, key: U256) -> u64 {
+		pool.lock().unwrap()[&key]
+			.last_poll
+			.to_min_block_num()
+			.unwrap()
+	}
+
+	#[test]
+	fn filter_cursor_only_moves_forward() {
+		let key = U256::from(7);
+		let pool = pool_with(key, 10);
+
+		advance_filter_cursor(&pool, key, 20);
+		assert_eq!(last_poll(&pool, key), 20);
+
+		advance_filter_cursor(&pool, key, 15);
+		assert_eq!(last_poll(&pool, key), 20);
+	}
+
+	#[test]
+	fn filter_cursor_ignores_removed_filters() {
+		let pool = pool_with(U256::from(7), 10);
+		advance_filter_cursor(&pool, U256::from(8), 20);
+		assert_eq!(pool.lock().unwrap().len(), 1);
+		assert_eq!(last_poll(&pool, U256::from(7)), 10);
+	}
+
+	#[test]
+	fn filter_size_limits() {
+		let addresses = |n: u64| {
+			Some(VariadicValue::Multiple(
+				(0..n).map(H160::from_low_u64_be).collect(),
+			))
+		};
+
+		let filter = Filter {
+			address: addresses(MAX_FILTER_ADDRESSES as u64),
+			..Default::default()
+		};
+		assert!(validate_filter_size(&filter).is_ok());
+
+		let filter = Filter {
+			address: addresses(MAX_FILTER_ADDRESSES as u64 + 1),
+			..Default::default()
+		};
+		assert!(validate_filter_size(&filter).is_err());
+
+		let options = |n: u64| VariadicValue::Multiple((0..n).map(H256::from_low_u64_be).collect());
+		let filter = Filter {
+			topics: Some(
+				vec![options(1), options(MAX_FILTER_TOPIC_OPTIONS as u64 + 1)]
+					.try_into()
+					.unwrap(),
+			),
+			..Default::default()
+		};
+		assert!(validate_filter_size(&filter).is_err());
+	}
+
+	#[test]
+	fn max_past_logs_applies_to_single_block_results() {
+		let log = Log {
+			address: H160::zero(),
+			topics: vec![],
+			data: Bytes(vec![]),
+			block_hash: None,
+			block_number: None,
+			transaction_hash: None,
+			transaction_index: None,
+			log_index: None,
+			transaction_log_index: None,
+			removed: false,
+		};
+		let logs = vec![log; 3];
+		assert!(ensure_within_max_past_logs(&logs, 3).is_ok());
+		assert!(ensure_within_max_past_logs(&logs, 2).is_err());
+	}
+
+	fn log_in_block(number: u64) -> Log {
+		Log {
+			address: H160::zero(),
+			topics: vec![H256::zero()],
+			data: Bytes(vec![0u8; 100]),
+			block_hash: None,
+			block_number: Some(U256::from(number)),
+			transaction_hash: None,
+			transaction_index: None,
+			log_index: None,
+			transaction_log_index: None,
+			removed: false,
+		}
+	}
+
+	#[test]
+	fn response_cap_keeps_logs_within_budget() {
+		let logs = vec![log_in_block(1), log_in_block(2)];
+		let (kept, cutoff) = cap_logs_to_response_size(logs, 10_000).unwrap();
+		assert_eq!(kept.len(), 2);
+		assert_eq!(cutoff, None);
+	}
+
+	#[test]
+	fn response_cap_trims_to_whole_blocks() {
+		let one = log_json_bytes(&log_in_block(0));
+
+		// The budget ends inside block 2, so block 2 is dropped whole and the cursor stops there.
+		let logs = vec![log_in_block(1), log_in_block(2), log_in_block(2)];
+		let (kept, cutoff) = cap_logs_to_response_size(logs, 2 * one).unwrap();
+		assert_eq!(kept.len(), 1);
+		assert_eq!(cutoff, Some(2));
+
+		// A budget ending inside the first block leaves nothing to return.
+		let logs = vec![log_in_block(1), log_in_block(1)];
+		assert!(cap_logs_to_response_size(logs, one).is_err());
+	}
 }

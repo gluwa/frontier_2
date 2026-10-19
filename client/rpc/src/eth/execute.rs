@@ -47,6 +47,14 @@ use crate::{
 	frontier_backend_client, internal_err,
 };
 
+/// Maximum number of accounts a single call may override.
+const MAX_STATE_OVERRIDE_ACCOUNTS: usize = 256;
+/// Maximum number of explicit storage slots (`state` + `stateDiff`, all accounts) per call.
+const MAX_STATE_OVERRIDE_SLOTS: usize = 10_000;
+/// Maximum number of existing storage keys a call may clear through full `state`
+/// replacement, summed over all overridden accounts.
+const MAX_STATE_OVERRIDE_CLEARED_KEYS: usize = 10_000;
+
 /// Allow to adapt a request for `estimate_gas`.
 /// Can be used to estimate gas of some contracts using a different function
 /// in the case the normal gas estimation doesn't work.
@@ -1326,6 +1334,9 @@ where
 	) -> RpcResult<OverlayedChanges<HashingFor<B>>> {
 		let mut overlayed_changes = OverlayedChanges::default();
 		if let Some(state_overrides) = state_overrides {
+			validate_state_override_limits(&state_overrides)?;
+			let mut cleared_keys_budget = MAX_STATE_OVERRIDE_CLEARED_KEYS;
+
 			for (address, state_override) in state_overrides {
 				if EC::RuntimeStorageOverride::is_enabled() {
 					EC::RuntimeStorageOverride::set_overlayed_changes(
@@ -1363,14 +1374,22 @@ where
 				// Use `state` first. If `stateDiff` is also present, it resolves consistently
 				if let Some(state) = &state_override.state {
 					// clear all storage
-					if let Ok(all_keys) = self.client.storage_keys(
-						block_hash,
-						Some(&sp_storage::StorageKey(account_storage_key.clone())),
-						None,
-					) {
-						for key in all_keys {
-							overlayed_changes.set_storage(key.0, None);
+					let all_keys = self
+						.client
+						.storage_keys(
+							block_hash,
+							Some(&sp_storage::StorageKey(account_storage_key.clone())),
+							None,
+						)
+						.map_err(|err| internal_err(format!("storage error: {err}")))?;
+					for key in all_keys {
+						if cleared_keys_budget == 0 {
+							return Err(internal_err(format!(
+								"state override clears too many storage slots (maximum {MAX_STATE_OVERRIDE_CLEARED_KEYS})"
+							)));
 						}
+						cleared_keys_budget -= 1;
+						overlayed_changes.set_storage(key.0, None);
 					}
 					// set provided storage
 					for (k, v) in state {
@@ -1396,6 +1415,27 @@ where
 
 		Ok(overlayed_changes)
 	}
+}
+
+/// Rejects state overrides whose size exceeds the per-call limits, before any storage is read.
+fn validate_state_override_limits(
+	state_overrides: &BTreeMap<H160, CallStateOverride>,
+) -> RpcResult<()> {
+	if state_overrides.len() > MAX_STATE_OVERRIDE_ACCOUNTS {
+		return Err(internal_err(format!(
+			"too many state override accounts (maximum {MAX_STATE_OVERRIDE_ACCOUNTS})"
+		)));
+	}
+	let slots = state_overrides.values().fold(0usize, |acc, ov| {
+		acc.saturating_add(ov.state.as_ref().map_or(0, BTreeMap::len))
+			.saturating_add(ov.state_diff.as_ref().map_or(0, BTreeMap::len))
+	});
+	if slots > MAX_STATE_OVERRIDE_SLOTS {
+		return Err(internal_err(format!(
+			"too many state override slots (maximum {MAX_STATE_OVERRIDE_SLOTS})"
+		)));
+	}
+	Ok(())
 }
 
 pub fn error_on_execution_failure(reason: &ExitReason, data: &[u8]) -> RpcResult<()> {
@@ -1488,5 +1528,65 @@ fn fee_details(
 			max_priority_fee_per_gas: Some(U256::zero()),
 			fee_cap: U256::zero(),
 		}),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn with_slots(n: usize) -> CallStateOverride {
+		CallStateOverride {
+			state: Some(
+				(0..n)
+					.map(|i| (H256::from_low_u64_be(i as u64), H256::zero()))
+					.collect(),
+			),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn state_override_limits_accept_within_bounds() {
+		let overrides: BTreeMap<_, _> = (0..MAX_STATE_OVERRIDE_ACCOUNTS)
+			.map(|i| {
+				(
+					H160::from_low_u64_be(i as u64),
+					CallStateOverride::default(),
+				)
+			})
+			.collect();
+		assert!(validate_state_override_limits(&overrides).is_ok());
+
+		let overrides = BTreeMap::from([(H160::zero(), with_slots(MAX_STATE_OVERRIDE_SLOTS))]);
+		assert!(validate_state_override_limits(&overrides).is_ok());
+	}
+
+	#[test]
+	fn state_override_limits_reject_too_many_accounts() {
+		let overrides: BTreeMap<_, _> = (0..=MAX_STATE_OVERRIDE_ACCOUNTS)
+			.map(|i| {
+				(
+					H160::from_low_u64_be(i as u64),
+					CallStateOverride::default(),
+				)
+			})
+			.collect();
+		assert!(validate_state_override_limits(&overrides).is_err());
+	}
+
+	#[test]
+	fn state_override_limits_count_slots_across_accounts_and_fields() {
+		let half = MAX_STATE_OVERRIDE_SLOTS / 2;
+		let mut split = with_slots(half);
+		split.state_diff = with_slots(half + 1).state;
+		let overrides = BTreeMap::from([(H160::zero(), split)]);
+		assert!(validate_state_override_limits(&overrides).is_err());
+
+		let overrides = BTreeMap::from([
+			(H160::from_low_u64_be(1), with_slots(half)),
+			(H160::from_low_u64_be(2), with_slots(half + 1)),
+		]);
+		assert!(validate_state_override_limits(&overrides).is_err());
 	}
 }
