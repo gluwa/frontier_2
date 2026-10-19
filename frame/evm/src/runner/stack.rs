@@ -1001,12 +1001,18 @@ pub struct Recorded {
 	account_storages: BTreeMap<(H160, H256), bool>,
 }
 
+/// Transient storage writes of one call frame: each slot with the value it held before the write.
+type TransientJournal = Vec<((H160, H256), Option<H256>)>;
+
 /// Substrate backend for EVM.
 pub struct SubstrateStackState<'vicinity, 'config, T> {
 	vicinity: &'vicinity Vicinity,
 	substate: SubstrateStackSubstate<'config>,
 	original_storage: BTreeMap<(H160, H256), H256>,
 	transient_storage: BTreeMap<(H160, H256), H256>,
+	/// One journal per open call frame, recording the value each transient slot held before the
+	/// frame first wrote it, so a reverted frame's writes can be undone (EIP-1153).
+	transient_journal: Vec<TransientJournal>,
 	recorded: Recorded,
 	weight_info: Option<WeightInfo>,
 	storage_meter: Option<StorageMeter>,
@@ -1034,6 +1040,7 @@ impl<'vicinity, 'config, T: Config> SubstrateStackState<'vicinity, 'config, T> {
 			_marker: PhantomData,
 			original_storage: BTreeMap::new(),
 			transient_storage: BTreeMap::new(),
+			transient_journal: Vec::new(),
 			recorded: Default::default(),
 			weight_info,
 			storage_meter,
@@ -1042,6 +1049,18 @@ impl<'vicinity, 'config, T: Config> SubstrateStackState<'vicinity, 'config, T> {
 
 	pub fn weight_info(&self) -> Option<WeightInfo> {
 		self.weight_info
+	}
+
+	/// Undo the transient storage writes of the frame being exited, newest first.
+	fn rollback_transient_frame(&mut self) {
+		if let Some(journal) = self.transient_journal.pop() {
+			for (slot, previous) in journal.into_iter().rev() {
+				match previous {
+					Some(value) => self.transient_storage.insert(slot, value),
+					None => self.transient_storage.remove(&slot),
+				};
+			}
+		}
 	}
 
 	pub fn recorded(&self) -> &Recorded {
@@ -1202,18 +1221,28 @@ where
 	}
 
 	fn enter(&mut self, gas_limit: u64, is_static: bool) {
+		self.transient_journal.push(Vec::new());
 		self.substate.enter(gas_limit, is_static)
 	}
 
 	fn exit_commit(&mut self) -> Result<(), ExitError> {
+		// A committed frame's writes can still be undone by an enclosing frame's revert, so hand
+		// its journal to the parent frame.
+		if let Some(mut journal) = self.transient_journal.pop() {
+			if let Some(parent) = self.transient_journal.last_mut() {
+				parent.append(&mut journal);
+			}
+		}
 		self.substate.exit_commit()
 	}
 
 	fn exit_revert(&mut self) -> Result<(), ExitError> {
+		self.rollback_transient_frame();
 		self.substate.exit_revert()
 	}
 
 	fn exit_discard(&mut self) -> Result<(), ExitError> {
+		self.rollback_transient_frame();
 		self.substate.exit_discard()
 	}
 
@@ -1264,7 +1293,10 @@ where
 	}
 
 	fn set_transient_storage(&mut self, address: H160, key: H256, value: H256) {
-		self.transient_storage.insert((address, key), value);
+		let previous = self.transient_storage.insert((address, key), value);
+		if let Some(journal) = self.transient_journal.last_mut() {
+			journal.push(((address, key), previous));
+		}
 	}
 
 	fn reset_storage(&mut self, address: H160) {
@@ -1715,6 +1747,100 @@ mod tests {
 				|_| (ExitReason::Succeed(ExitSucceed::Stopped), ()),
 			);
 			assert!(res.is_ok());
+		});
+	}
+}
+
+#[cfg(test)]
+mod transient_storage_tests {
+	use super::*;
+	use crate::mock::Test;
+	use sp_io::TestExternalities;
+
+	const CONFIG: evm::Config = evm::Config::cancun();
+
+	// Frames are entered with zero gas: the tests exercise transient storage only, and the
+	// gasometer would otherwise expect the parent to have been charged for the child's gas.
+	fn with_state(f: impl FnOnce(&mut SubstrateStackState<'_, '_, Test>)) {
+		TestExternalities::new_empty().execute_with(|| {
+			let vicinity = Vicinity {
+				gas_price: U256::zero(),
+				origin: H160::zero(),
+			};
+			let metadata = StackSubstateMetadata::new(1_000_000, &CONFIG);
+			let mut state = SubstrateStackState::<Test>::new(&vicinity, metadata, None, None);
+			f(&mut state);
+		});
+	}
+
+	fn slot(n: u64) -> (H160, H256) {
+		(H160::from_low_u64_be(1), H256::from_low_u64_be(n))
+	}
+
+	fn tstore(state: &mut SubstrateStackState<'_, '_, Test>, n: u64, v: u64) {
+		let (address, key) = slot(n);
+		state.set_transient_storage(address, key, H256::from_low_u64_be(v));
+	}
+
+	fn tload(state: &SubstrateStackState<'_, '_, Test>, n: u64) -> H256 {
+		let (address, key) = slot(n);
+		state.transient_storage(address, key)
+	}
+
+	#[test]
+	fn reverted_frame_restores_previous_values() {
+		with_state(|state| {
+			state.enter(0, false);
+			tstore(state, 1, 11);
+			state.enter(0, false);
+			tstore(state, 1, 22);
+			tstore(state, 2, 33);
+			state.exit_revert().unwrap();
+			assert_eq!(tload(state, 1), H256::from_low_u64_be(11));
+			assert_eq!(tload(state, 2), H256::zero());
+			state.exit_commit().unwrap();
+			assert_eq!(tload(state, 1), H256::from_low_u64_be(11));
+		});
+	}
+
+	#[test]
+	fn discarded_frame_restores_previous_values() {
+		with_state(|state| {
+			state.enter(0, false);
+			state.enter(0, false);
+			tstore(state, 1, 5);
+			state.exit_discard().unwrap();
+			assert_eq!(tload(state, 1), H256::zero());
+			state.exit_commit().unwrap();
+		});
+	}
+
+	#[test]
+	fn outer_revert_undoes_committed_inner_writes() {
+		with_state(|state| {
+			state.enter(0, false);
+			tstore(state, 1, 1);
+			state.enter(0, false);
+			state.enter(0, false);
+			tstore(state, 1, 2);
+			tstore(state, 1, 3);
+			state.exit_commit().unwrap();
+			assert_eq!(tload(state, 1), H256::from_low_u64_be(3));
+			state.exit_revert().unwrap();
+			assert_eq!(tload(state, 1), H256::from_low_u64_be(1));
+			state.exit_commit().unwrap();
+		});
+	}
+
+	#[test]
+	fn committed_frames_keep_their_writes() {
+		with_state(|state| {
+			state.enter(0, false);
+			state.enter(0, false);
+			tstore(state, 1, 7);
+			state.exit_commit().unwrap();
+			state.exit_commit().unwrap();
+			assert_eq!(tload(state, 1), H256::from_low_u64_be(7));
 		});
 	}
 }
