@@ -34,6 +34,7 @@ mod eip1559;
 mod eip2930;
 mod eip7702;
 mod extra_data;
+mod finalization_weight;
 mod legacy;
 mod pre_log;
 

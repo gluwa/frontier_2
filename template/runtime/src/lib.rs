@@ -396,6 +396,7 @@ parameter_types! {
 }
 
 impl pallet_ethereum::Config for Runtime {
+	type FinalizationWeight = ();
 	type StateRoot = pallet_ethereum::IntermediateStateRoot<Self::Version>;
 	type PostLogContent = PostBlockAndTxnHashes;
 	type ExtraDataLength = ConstU32<30>;

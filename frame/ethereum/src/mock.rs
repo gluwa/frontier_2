@@ -151,7 +151,24 @@ impl pallet_evm::Config for Test {
 }
 
 #[derive_impl(crate::config_preludes::TestDefaultConfig)]
-impl Config for Test {}
+impl Config for Test {
+	type FinalizationWeight = TestFinalizationWeight;
+}
+
+parameter_types! {
+	pub static FinalizationBase: Weight = Weight::zero();
+	pub static FinalizationPerGas: Weight = Weight::zero();
+}
+
+pub struct TestFinalizationWeight;
+impl FinalizationWeight for TestFinalizationWeight {
+	fn base() -> Weight {
+		FinalizationBase::get()
+	}
+	fn transaction(gas: u64) -> Weight {
+		FinalizationPerGas::get().saturating_mul(gas)
+	}
+}
 
 impl fp_self_contained::SelfContainedCall for RuntimeCall {
 	type SignedInfo = H160;

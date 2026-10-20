@@ -19,11 +19,28 @@
 
 use super::*;
 use crate::{Bloom, DigestItem, Encode, PreLog, FRONTIER_ENGINE_ID, H64};
-use frame_support::{traits::Hooks, weights::Weight};
+use frame_support::{
+	traits::{Get, Hooks},
+	weights::Weight,
+};
 use frame_system::WeightInfo as _;
 
 // Gas used by a plain value transfer.
 const TRANSFER_GAS: u64 = 21_000;
+
+#[test]
+#[should_panic(expected = "pre-block transaction weight exceeds the block weight limit")]
+fn pre_log_admission_includes_deferred_finalization() {
+	let (pairs, mut ext) = new_test_ext(2);
+	ext.execute_with(|| {
+		let _reset = super::finalization_weight::ResetWeights;
+		let limits: frame_system::limits::BlockWeights =
+			<Test as frame_system::Config>::BlockWeights::get();
+		let max = limits.max_block;
+		FinalizationPerGas::set(Weight::from_parts(max.ref_time() / TRANSFER_GAS + 1, 0));
+		initialize_pre_log_block(&pairs[0], pairs[1].address, 1);
+	});
+}
 
 fn transfer(sender: &AccountInfo, recipient: H160, nonce: u64) -> Transaction {
 	LegacyUnsignedTransaction {

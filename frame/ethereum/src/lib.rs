@@ -192,6 +192,25 @@ pub enum PostLogContent {
 
 pub use self::pallet::*;
 
+/// Work deferred until the pending transactions are assembled into an Ethereum block.
+///
+/// `transaction` must be monotonic in gas and include both execution and proof-size costs.
+/// It is charged at the gas limit before dispatch and reclaimed only down to gas actually
+/// consumed, so the remaining reservation survives until finalization.
+pub trait FinalizationWeight {
+	fn base() -> Weight;
+	fn transaction(gas: u64) -> Weight;
+}
+
+impl FinalizationWeight for () {
+	fn base() -> Weight {
+		Weight::zero()
+	}
+	fn transaction(_: u64) -> Weight {
+		Weight::zero()
+	}
+}
+
 #[frame_support::pallet]
 pub mod pallet {
 	use super::*;
@@ -213,6 +232,8 @@ pub mod pallet {
 		type PostLogContent: Get<PostLogContent>;
 		/// The maximum length of the extra data in the Executed event.
 		type ExtraDataLength: Get<u32>;
+		/// Benchmarked block assembly cost, separate from EVM execution gas weight.
+		type FinalizationWeight: FinalizationWeight;
 	}
 
 	pub mod config_preludes {
@@ -236,6 +257,7 @@ pub mod pallet {
 			type StateRoot = IntermediateStateRoot<Self::Version>;
 			type PostLogContent = PostBlockAndTxnHashes;
 			type ExtraDataLength = ConstU32<30>;
+			type FinalizationWeight = ();
 		}
 	}
 
@@ -268,7 +290,9 @@ pub mod pallet {
 		}
 
 		fn on_initialize(_: BlockNumberFor<T>) -> Weight {
-			let mut weight = T::SystemWeightInfo::kill_storage(1);
+			let mut weight = T::SystemWeightInfo::kill_storage(1)
+				.saturating_add(T::DbWeight::get().reads_writes(2, 2))
+				.saturating_add(T::FinalizationWeight::base());
 
 			// If the digest contain an existing ethereum block(encoded as PreLog), If contains,
 			// execute the imported block firstly and disable transact dispatch function.
@@ -281,6 +305,19 @@ pub mod pallet {
 				let mut cumulative_gas_used = U256::zero();
 
 				for transaction in block.transactions {
+					// Pre-log transactions do not go through CheckWeight. Apply the same
+					// conservative admission rule here, including their deferred assembly cost.
+					let limits = T::BlockWeights::get();
+					let base = limits
+						.get(frame_support::dispatch::DispatchClass::Normal)
+						.base_extrinsic;
+					let declared =
+						Self::transaction_dispatch_weight(&transaction).saturating_add(base);
+					assert!(
+						frame_system::Pallet::<T>::block_weight().total()
+							.saturating_add(weight).saturating_add(declared).all_lte(limits.max_block),
+						"pre-block transaction weight exceeds the block weight limit; the block cannot be built",
+					);
 					let source = Self::recover_signer(&transaction).expect(
 						"pre-block transaction signature invalid; the block cannot be built",
 					);
@@ -305,7 +342,9 @@ pub mod pallet {
 						"pre-block gas used exceeds the block gas limit; the block cannot be built",
 					);
 
-					weight = weight.saturating_add(r.actual_weight.unwrap_or_default());
+					weight = weight
+						.saturating_add(r.actual_weight.unwrap_or_default())
+						.saturating_add(base);
 				}
 			}
 			// Account for `on_finalize` weight:
@@ -313,7 +352,7 @@ pub mod pallet {
 			//	- read: frame_system::Pallet::<T>::block_number()
 			//	- write: <Pallet<T>>::store_block()
 			//	- write: <BlockHash<T>>::remove()
-			weight.saturating_add(T::DbWeight::get().reads_writes(2, 2))
+			weight
 		}
 
 		fn on_runtime_upgrade() -> Weight {
@@ -334,11 +373,7 @@ pub mod pallet {
 		/// Transact an Ethereum transaction.
 		#[pallet::call_index(0)]
 		#[pallet::weight({
-			let without_base_extrinsic_weight = true;
-			<T as pallet_evm::Config>::GasWeightMapping::gas_to_weight({
-				let transaction_data: TransactionData = transaction.into();
-				transaction_data.gas_limit.unique_saturated_into()
-			}, without_base_extrinsic_weight)
+			Pallet::<T>::transaction_dispatch_weight(transaction)
 		})]
 		pub fn transact(
 			origin: OriginFor<T>,
@@ -418,6 +453,14 @@ pub mod pallet {
 }
 
 impl<T: Config> Pallet<T> {
+	/// Execution plus deferred block assembly, before FRAME adds the base extrinsic weight.
+	pub fn transaction_dispatch_weight(transaction: &Transaction) -> Weight {
+		let transaction_data: TransactionData = transaction.into();
+		let gas = transaction_data.gas_limit.unique_saturated_into();
+		<T as pallet_evm::Config>::GasWeightMapping::gas_to_weight(gas, true)
+			.saturating_add(T::FinalizationWeight::transaction(gas))
+	}
+
 	pub fn transaction_weight(transaction_data: &TransactionData) -> (Option<Weight>, Option<u64>) {
 		match <T as pallet_evm::Config>::GasWeightMapping::gas_to_weight(
 			transaction_data.gas_limit.unique_saturated_into(),
@@ -499,15 +542,15 @@ impl<T: Config> Pallet<T> {
 			if let Some((transaction, status, receipt)) = Pending::<T>::take(transaction_index) {
 				transactions.push(transaction);
 				statuses.push(status);
-				receipts.push(receipt.clone());
-				let (logs, used_gas) = match receipt {
+				let (logs, used_gas) = match &receipt {
 					Receipt::Legacy(d) | Receipt::EIP2930(d) | Receipt::EIP1559(d) => {
-						(d.logs.clone(), d.used_gas)
+						(&d.logs, d.used_gas)
 					}
-					Receipt::EIP7702(d) => (d.logs.clone(), d.used_gas),
+					Receipt::EIP7702(d) => (&d.logs, d.used_gas),
 				};
 				cumulative_gas_used = used_gas;
 				Self::logs_bloom(logs, &mut logs_bloom);
+				receipts.push(receipt);
 			}
 		}
 
@@ -543,11 +586,11 @@ impl<T: Config> Pallet<T> {
 			mix_hash: H256::default(),
 			nonce: H64::default(),
 		};
-		let block = ethereum::Block::new(partial_header, transactions.clone(), ommers);
+		let block = ethereum::Block::new(partial_header, transactions, ommers);
 
-		CurrentBlock::<T>::put(block.clone());
-		CurrentReceipts::<T>::put(receipts.clone());
-		CurrentTransactionStatuses::<T>::put(statuses.clone());
+		CurrentBlock::<T>::put(&block);
+		CurrentReceipts::<T>::put(&receipts);
+		CurrentTransactionStatuses::<T>::put(&statuses);
 		BlockHash::<T>::insert(block_number, block.header.hash());
 
 		match post_log {
@@ -569,10 +612,10 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	fn logs_bloom(logs: Vec<Log>, bloom: &mut Bloom) {
+	fn logs_bloom(logs: &[Log], bloom: &mut Bloom) {
 		for log in logs {
 			bloom.accrue(BloomInput::Raw(&log.address[..]));
-			for topic in log.topics {
+			for topic in &log.topics {
 				bloom.accrue(BloomInput::Raw(&topic[..]));
 			}
 		}
@@ -736,7 +779,7 @@ impl<T: Config> Pallet<T> {
 					logs: info.logs.clone(),
 					logs_bloom: {
 						let mut bloom: Bloom = Bloom::default();
-						Self::logs_bloom(info.logs, &mut bloom);
+						Self::logs_bloom(&info.logs, &mut bloom);
 						bloom
 					},
 				},
@@ -759,7 +802,7 @@ impl<T: Config> Pallet<T> {
 					logs: info.logs.clone(),
 					logs_bloom: {
 						let mut bloom: Bloom = Bloom::default();
-						Self::logs_bloom(info.logs, &mut bloom);
+						Self::logs_bloom(&info.logs, &mut bloom);
 						bloom
 					},
 				},
@@ -842,7 +885,12 @@ impl<T: Config> Pallet<T> {
 							*gas_to_weight.proof_size_mut() = proof_size_usage;
 						}
 					}
-					Some(gas_to_weight)
+					Some(
+						gas_to_weight.saturating_add(T::FinalizationWeight::transaction(
+							core::cmp::max(used_gas.standard, used_gas.effective)
+								.unique_saturated_into(),
+						)),
+					)
 				},
 				pays_fee: Pays::No,
 			},
