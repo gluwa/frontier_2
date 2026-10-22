@@ -295,4 +295,105 @@ describeWithFrontier("Frontier RPC (estimate gas shortcut)", (context) => {
 		]);
 		expect(context.web3.utils.hexToNumber(estimate.result)).to.be.above(21000);
 	});
+
+	// An account that has never been funded.
+	const UNFUNDED_ACCOUNT = "0x120000000000000000000000000000000000000c";
+
+	step("does not use the flat minimum-gas shortcut for an underfunded transfer", async function () {
+		const result = await customRequest(context.web3, "eth_estimateGas", [
+			{
+				from: UNFUNDED_ACCOUNT,
+				to: NO_CODE_ADDRESS,
+				value: "0x1",
+			},
+		]);
+		expect(result.result).to.be.undefined;
+		expect(result.error).to.exist;
+	});
+
+	step(
+		"does not use the flat minimum-gas shortcut for an underfunded transfer with a gas price",
+		async function () {
+			const result = await customRequest(context.web3, "eth_estimateGas", [
+				{
+					from: UNFUNDED_ACCOUNT,
+					to: NO_CODE_ADDRESS,
+					value: "0x1",
+					gasPrice: "0x3B9ACA00",
+				},
+			]);
+			expect(result.result).to.be.undefined;
+			expect(result.error.message).to.equal("insufficient funds for transfer");
+		}
+	);
+
+	step(
+		"does not use the flat minimum-gas shortcut when the fee can not be afforded",
+		async function () {
+			const result = await customRequest(context.web3, "eth_estimateGas", [
+				{
+					from: UNFUNDED_ACCOUNT,
+					to: NO_CODE_ADDRESS,
+					gasPrice: "0x3B9ACA00",
+				},
+			]);
+			expect(result.result).to.be.undefined;
+			expect(result.error).to.exist;
+		}
+	);
+
+	step("does not use the flat minimum-gas shortcut for an over-cap transfer", async function () {
+		const result = await customRequest(context.web3, "eth_estimateGas", [
+			{
+				from: GENESIS_ACCOUNT,
+				to: NO_CODE_ADDRESS,
+				value: "0x1",
+				gas: context.web3.utils.numberToHex(ETH_BLOCK_GAS_LIMIT * 1000),
+			},
+		]);
+		expect(result.result).to.be.undefined;
+		expect(result.error.message).to.match(/^provided gas limit is too high/);
+	});
+
+	step(
+		"does not use the flat minimum-gas shortcut when the gas limit is below the minimum",
+		async function () {
+			const result = await customRequest(context.web3, "eth_estimateGas", [
+				{
+					from: GENESIS_ACCOUNT,
+					to: NO_CODE_ADDRESS,
+					value: "0x1",
+					gas: context.web3.utils.numberToHex(20999),
+				},
+			]);
+			expect(result.result).to.be.undefined;
+			expect(result.error).to.exist;
+		}
+	);
+
+	step("does not use the flat minimum-gas shortcut for invalid fee parameters", async function () {
+		const result = await customRequest(context.web3, "eth_estimateGas", [
+			{
+				from: GENESIS_ACCOUNT,
+				to: NO_CODE_ADDRESS,
+				value: "0x1",
+				maxFeePerGas: "0x1",
+				maxPriorityFeePerGas: "0x2",
+			},
+		]);
+		expect(result.result).to.be.undefined;
+		expect(result.error.message).to.match(/max_priority_fee_per_gas/);
+	});
+
+	step("uses the flat minimum-gas shortcut for a funded transfer with a gas price", async function () {
+		const estimate = await customRequest(context.web3, "eth_estimateGas", [
+			{
+				from: GENESIS_ACCOUNT,
+				to: NO_CODE_ADDRESS,
+				value: "0x1",
+				gasPrice: "0x3B9ACA00",
+			},
+		]);
+		expect(context.web3.utils.hexToNumber(estimate.result)).to.equal(21000);
+	});
 });

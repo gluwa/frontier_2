@@ -706,35 +706,6 @@ where
 		// Adapt request for gas estimation.
 		let request = EC::EstimateGasAdapter::adapt_request(request);
 
-		// For a simple transfer (no calldata, no EIP-2930 access list, and no EIP-7702
-		// authorization list, all of which carry their own intrinsic gas cost) to a plain
-		// account, return MIN_GAS_PER_TX directly.
-		let is_simple_transfer = match &request.data() {
-			None => true,
-			Some(vec) => vec.0.is_empty(),
-		} && request
-			.access_list
-			.as_ref()
-			.is_none_or(|list| list.is_empty())
-			&& request
-				.authorization_list
-				.as_ref()
-				.is_none_or(|list| list.is_empty());
-		if is_simple_transfer {
-			if let Some(to) = request.to {
-				// Registered precompiles execute and charge gas despite having no ordinary
-				// account code, so they must never be eligible for the flat-fee shortcut.
-				if !EC::is_precompile(to) {
-					let to_code = api
-						.account_code_at(substrate_hash, to)
-						.map_err(|err| internal_err(format!("runtime error: {err}")))?;
-					if to_code.is_empty() {
-						return Ok(MIN_GAS_PER_TX);
-					}
-				}
-			}
-		}
-
 		let block_gas_limit = {
 			let block = block_data_cache.current_block(substrate_hash).await;
 			block
@@ -803,6 +774,49 @@ where
 							allowance
 						);
 					highest = allowance;
+				}
+			}
+		}
+
+		// For a simple transfer (no calldata, no EIP-2930 access list, and no EIP-7702
+		// authorization list, all of which carry their own intrinsic gas cost) to a plain
+		// account, return MIN_GAS_PER_TX directly.
+		//
+		// The shortcut is only taken once the gas cap, fee parameters and balance checks above
+		// have passed. A transfer that can not afford MIN_GAS_PER_TX or its value falls through
+		// to the regular estimation, which reports why it is invalid.
+		let is_simple_transfer = match &request.data() {
+			None => true,
+			Some(vec) => vec.0.is_empty(),
+		} && request
+			.access_list
+			.as_ref()
+			.is_none_or(|list| list.is_empty())
+			&& request
+				.authorization_list
+				.as_ref()
+				.is_none_or(|list| list.is_empty());
+		if is_simple_transfer && highest >= MIN_GAS_PER_TX {
+			if let Some(to) = request.to {
+				// Registered precompiles execute and charge gas despite having no ordinary
+				// account code, so they must never be eligible for the flat-fee shortcut.
+				if !EC::is_precompile(to) {
+					let to_code = api
+						.account_code_at(substrate_hash, to)
+						.map_err(|err| internal_err(format!("runtime error: {err}")))?;
+					if to_code.is_empty() {
+						// The balance check above is skipped without a fee cap, so the value is
+						// checked here as well.
+						let value = request.value.unwrap_or_default();
+						let funds_value = value.is_zero()
+							|| api
+								.account_basic(substrate_hash, request.from.unwrap_or_default())
+								.map_err(|err| internal_err(format!("runtime error: {err}")))?
+								.balance >= value;
+						if funds_value {
+							return Ok(MIN_GAS_PER_TX);
+						}
+					}
 				}
 			}
 		}
