@@ -311,36 +311,30 @@ describeWithFrontier("Frontier RPC (estimate gas shortcut)", (context) => {
 		expect(result.error).to.exist;
 	});
 
-	step(
-		"does not use the flat minimum-gas shortcut for an underfunded transfer with a gas price",
-		async function () {
-			const result = await customRequest(context.web3, "eth_estimateGas", [
-				{
-					from: UNFUNDED_ACCOUNT,
-					to: NO_CODE_ADDRESS,
-					value: "0x1",
-					gasPrice: "0x3B9ACA00",
-				},
-			]);
-			expect(result.result).to.be.undefined;
-			expect(result.error.message).to.equal("insufficient funds for transfer");
-		}
-	);
+	step("does not use the flat minimum-gas shortcut for an underfunded transfer with a gas price", async function () {
+		const result = await customRequest(context.web3, "eth_estimateGas", [
+			{
+				from: UNFUNDED_ACCOUNT,
+				to: NO_CODE_ADDRESS,
+				value: "0x1",
+				gasPrice: "0x3B9ACA00",
+			},
+		]);
+		expect(result.result).to.be.undefined;
+		expect(result.error.message).to.equal("insufficient funds for transfer");
+	});
 
-	step(
-		"does not use the flat minimum-gas shortcut when the fee can not be afforded",
-		async function () {
-			const result = await customRequest(context.web3, "eth_estimateGas", [
-				{
-					from: UNFUNDED_ACCOUNT,
-					to: NO_CODE_ADDRESS,
-					gasPrice: "0x3B9ACA00",
-				},
-			]);
-			expect(result.result).to.be.undefined;
-			expect(result.error).to.exist;
-		}
-	);
+	step("does not use the flat minimum-gas shortcut when the fee can not be afforded", async function () {
+		const result = await customRequest(context.web3, "eth_estimateGas", [
+			{
+				from: UNFUNDED_ACCOUNT,
+				to: NO_CODE_ADDRESS,
+				gasPrice: "0x3B9ACA00",
+			},
+		]);
+		expect(result.result).to.be.undefined;
+		expect(result.error).to.exist;
+	});
 
 	step("does not use the flat minimum-gas shortcut for an over-cap transfer", async function () {
 		const result = await customRequest(context.web3, "eth_estimateGas", [
@@ -355,21 +349,18 @@ describeWithFrontier("Frontier RPC (estimate gas shortcut)", (context) => {
 		expect(result.error.message).to.match(/^provided gas limit is too high/);
 	});
 
-	step(
-		"does not use the flat minimum-gas shortcut when the gas limit is below the minimum",
-		async function () {
-			const result = await customRequest(context.web3, "eth_estimateGas", [
-				{
-					from: GENESIS_ACCOUNT,
-					to: NO_CODE_ADDRESS,
-					value: "0x1",
-					gas: context.web3.utils.numberToHex(20999),
-				},
-			]);
-			expect(result.result).to.be.undefined;
-			expect(result.error).to.exist;
-		}
-	);
+	step("does not use the flat minimum-gas shortcut when the gas limit is below the minimum", async function () {
+		const result = await customRequest(context.web3, "eth_estimateGas", [
+			{
+				from: GENESIS_ACCOUNT,
+				to: NO_CODE_ADDRESS,
+				value: "0x1",
+				gas: context.web3.utils.numberToHex(20999),
+			},
+		]);
+		expect(result.result).to.be.undefined;
+		expect(result.error).to.exist;
+	});
 
 	step("does not use the flat minimum-gas shortcut for invalid fee parameters", async function () {
 		const result = await customRequest(context.web3, "eth_estimateGas", [
