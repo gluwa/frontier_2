@@ -826,6 +826,301 @@ mod proof_size_test {
 			assert_eq!(actual_weight.proof_size(), expected_proof_size);
 		});
 	}
+
+	const CREATE2_SALT: H256 = H256::repeat_byte(0x11);
+
+	fn dispatch_create(
+		init: Vec<u8>,
+		value: U256,
+		gas_limit: u64,
+	) -> frame_support::dispatch::DispatchResultWithPostInfo {
+		EVM::create(
+			RuntimeOrigin::root(),
+			H160::default(),
+			init,
+			value,
+			gas_limit,
+			FixedGasPrice::min_gas_price().0,
+			None,
+			None,
+			Vec::new(),
+			Vec::new(),
+		)
+	}
+
+	fn dispatch_create2(
+		init: Vec<u8>,
+		value: U256,
+		gas_limit: u64,
+	) -> frame_support::dispatch::DispatchResultWithPostInfo {
+		EVM::create2(
+			RuntimeOrigin::root(),
+			H160::default(),
+			init,
+			CREATE2_SALT,
+			value,
+			gas_limit,
+			FixedGasPrice::min_gas_price().0,
+			None,
+			None,
+			Vec::new(),
+			Vec::new(),
+		)
+	}
+
+	/// Proof size base cost of a dispatched `create` or `create2` call.
+	fn create_proof_size_base_cost(call: crate::Call<Test>) -> u64 {
+		call.encoded_size() as u64
+			// signature
+			+ 65
+			// pallet index
+			+ 1
+	}
+
+	/// Init code that calls `target` and deploys an empty contract, so that the proof size of
+	/// loading the code of `target` is accounted for during contract creation.
+	fn init_code_calling(target: H160) -> Vec<u8> {
+		// PUSH1 0 (retSize), PUSH1 0 (retOffset), PUSH1 0 (argsSize), PUSH1 0 (argsOffset),
+		// PUSH1 0 (value)
+		let mut init = hex::decode("6000600060006000600073").unwrap();
+		// address
+		init.extend_from_slice(target.as_bytes());
+		// GAS, CALL, STOP
+		init.extend_from_slice(&hex::decode("5af100").unwrap());
+		init
+	}
+
+	fn assert_dispatched_create_post_info_uses_effective_gas(
+		dispatch: fn(Vec<u8>, U256, u64) -> frame_support::dispatch::DispatchResultWithPostInfo,
+	) {
+		new_test_ext().execute_with(|| {
+			System::set_block_number(1);
+
+			// Loading the large stored code of the target during contract creation makes the
+			// effective gas dominate the standard gas.
+			let fake_contract_address = H160::random();
+			let config = <Test as Config>::config().clone();
+			let fake_contract_code = vec![0; config.create_contract_limit.expect("a value")];
+			AccountCodes::<Test>::insert(fake_contract_address, fake_contract_code.clone());
+
+			let gas_limit: u64 = 1_000_000;
+			let post_info = dispatch(
+				init_code_calling(fake_contract_address),
+				U256::zero(),
+				gas_limit,
+			)
+			.expect("create succeeds");
+			let actual_weight = post_info.actual_weight.expect("actual weight");
+
+			let created = System::events()
+				.into_iter()
+				.find_map(|record| match record.event {
+					RuntimeEvent::EVM(crate::Event::<Test>::Created { address }) => Some(address),
+					_ => None,
+				});
+			assert!(created.is_some());
+
+			assert!(actual_weight.proof_size() > fake_contract_code.len() as u64);
+			let ratio = <<Test as Config>::GasLimitPovSizeRatio as Get<u64>>::get();
+			let effective_gas = actual_weight.proof_size() * ratio;
+			// Well above the standard cost of a creation that executes a single cold call.
+			assert!(effective_gas > 100_000 && effective_gas < gas_limit);
+			assert_eq!(
+				actual_weight.ref_time(),
+				FixedGasWeightMapping::<Test>::gas_to_weight(effective_gas, true).ref_time()
+			);
+		});
+	}
+
+	#[test]
+	fn dispatched_create_post_info_uses_effective_gas() {
+		assert_dispatched_create_post_info_uses_effective_gas(dispatch_create);
+	}
+
+	#[test]
+	fn dispatched_create2_post_info_uses_effective_gas() {
+		assert_dispatched_create_post_info_uses_effective_gas(dispatch_create2);
+	}
+
+	fn assert_dispatched_create_is_bound_by_proof_size_limit(
+		dispatch: fn(Vec<u8>, U256, u64) -> frame_support::dispatch::DispatchResultWithPostInfo,
+	) {
+		new_test_ext().execute_with(|| {
+			System::set_block_number(1);
+
+			// The gas limit covers the standard cost of the creation, but the proof size derived
+			// from it can not fit the stored code of the called target.
+			let fake_contract_address = H160::random();
+			let config = <Test as Config>::config().clone();
+			let fake_contract_code = vec![0; config.create_contract_limit.expect("a value")];
+			AccountCodes::<Test>::insert(fake_contract_address, fake_contract_code);
+
+			assert_ok!(dispatch(
+				init_code_calling(fake_contract_address),
+				U256::zero(),
+				100_000,
+			));
+
+			let failed = System::events()
+				.into_iter()
+				.find_map(|record| match record.event {
+					RuntimeEvent::EVM(crate::Event::<Test>::CreatedFailed { address }) => {
+						Some(address)
+					}
+					_ => None,
+				})
+				.expect("creation failed");
+			assert!(AccountCodes::<Test>::get(failed).is_empty());
+		});
+	}
+
+	#[test]
+	fn dispatched_create_is_bound_by_proof_size_limit() {
+		assert_dispatched_create_is_bound_by_proof_size_limit(dispatch_create);
+	}
+
+	#[test]
+	fn dispatched_create2_is_bound_by_proof_size_limit() {
+		assert_dispatched_create_is_bound_by_proof_size_limit(dispatch_create2);
+	}
+
+	fn assert_dispatched_create_is_rejected_when_encoded_call_exceeds_proof_size_limit(
+		dispatch: fn(Vec<u8>, U256, u64) -> frame_support::dispatch::DispatchResultWithPostInfo,
+	) {
+		new_test_ext().execute_with(|| {
+			System::set_block_number(1);
+
+			let ratio = <<Test as Config>::GasLimitPovSizeRatio as Get<u64>>::get();
+			// Init code of zeroes stops right away and deploys an empty contract.
+			let init = vec![0u8; 10_000];
+
+			// The gas limit pays for the init code, including its floor cost, but the proof size
+			// derived from it can not fit the encoded call.
+			let gas_limit = 53_000 + 10 * init.len() as u64 + 2 * (init.len() as u64).div_ceil(32);
+			assert!(gas_limit / ratio < init.len() as u64);
+
+			// Without a proof size limit the creation is valid.
+			<Test as Config>::Runner::validate(
+				H160::default(),
+				None,
+				init.clone(),
+				U256::zero(),
+				gas_limit,
+				Some(FixedGasPrice::min_gas_price().0),
+				None,
+				None,
+				Vec::new(),
+				Vec::new(),
+				true,
+				None,
+				None,
+				<Test as Config>::config(),
+			)
+			.expect("creation is valid without a proof size limit");
+
+			let nonce = EVM::account_basic(&H160::default()).0.nonce;
+			let err =
+				dispatch(init.clone(), U256::zero(), gas_limit).expect_err("creation is rejected");
+			assert_eq!(err.error, crate::Error::<Test>::GasLimitTooLow.into());
+			// The creation is rejected before any execution, so only the validation is accounted
+			// for, not the weight derived from the gas limit.
+			let declared_weight = FixedGasWeightMapping::<Test>::gas_to_weight(gas_limit, true);
+			assert!(err
+				.post_info
+				.actual_weight
+				.expect("actual weight")
+				.all_lt(declared_weight));
+			assert_eq!(err.post_info.pays_fee, frame_support::dispatch::Pays::Yes);
+			assert_eq!(EVM::account_basic(&H160::default()).0.nonce, nonce);
+			assert!(System::events().is_empty());
+
+			// The same creation is executed when the proof size limit fits the encoded call.
+			let gas_limit = gas_limit.max(ratio * (init.len() as u64 + 1_000));
+			assert_ok!(dispatch(init, U256::zero(), gas_limit));
+			assert!(System::events().into_iter().any(|record| matches!(
+				record.event,
+				RuntimeEvent::EVM(crate::Event::<Test>::Created { .. })
+			)));
+		});
+	}
+
+	#[test]
+	fn dispatched_create_is_rejected_when_encoded_call_exceeds_proof_size_limit() {
+		assert_dispatched_create_is_rejected_when_encoded_call_exceeds_proof_size_limit(
+			dispatch_create,
+		);
+	}
+
+	#[test]
+	fn dispatched_create2_is_rejected_when_encoded_call_exceeds_proof_size_limit() {
+		assert_dispatched_create_is_rejected_when_encoded_call_exceeds_proof_size_limit(
+			dispatch_create2,
+		);
+	}
+
+	#[test]
+	fn dispatched_create_reports_proof_size() {
+		new_test_ext().execute_with(|| {
+			let gas_limit: u64 = 1_000_000;
+			let init = hex::decode(PROOF_SIZE_TEST_CALLEE_CONTRACT_BYTECODE.trim_end()).unwrap();
+
+			let post_info =
+				dispatch_create(init.clone(), U256::zero(), gas_limit).expect("create succeeds");
+			let actual_weight = post_info.actual_weight.expect("actual weight");
+
+			// The encoded call is part of the proof, on top of the creation accounting.
+			let proof_size_base_cost = create_proof_size_base_cost(crate::Call::<Test>::create {
+				source: H160::default(),
+				init,
+				value: U256::zero(),
+				gas_limit,
+				max_fee_per_gas: FixedGasPrice::min_gas_price().0,
+				max_priority_fee_per_gas: None,
+				nonce: None,
+				access_list: Vec::new(),
+				authorization_list: Vec::new(),
+			});
+			let expected_proof_size = proof_size_base_cost
+				+ WRITE_PROOF_SIZE
+				+ IS_EMPTY_CHECK_PROOF_SIZE
+				+ (ACCOUNT_BASIC_PROOF_SIZE * 2);
+
+			assert_eq!(actual_weight.proof_size(), expected_proof_size);
+		});
+	}
+
+	#[test]
+	fn dispatched_create2_reports_proof_size() {
+		new_test_ext().execute_with(|| {
+			let gas_limit: u64 = 1_000_000;
+			let init = hex::decode(PROOF_SIZE_TEST_CALLEE_CONTRACT_BYTECODE.trim_end()).unwrap();
+
+			let post_info =
+				dispatch_create2(init.clone(), U256::zero(), gas_limit).expect("create2 succeeds");
+			let actual_weight = post_info.actual_weight.expect("actual weight");
+
+			// The encoded call, including the salt, is part of the proof, on top of the creation
+			// accounting.
+			let proof_size_base_cost = create_proof_size_base_cost(crate::Call::<Test>::create2 {
+				source: H160::default(),
+				init,
+				salt: CREATE2_SALT,
+				value: U256::zero(),
+				gas_limit,
+				max_fee_per_gas: FixedGasPrice::min_gas_price().0,
+				max_priority_fee_per_gas: None,
+				nonce: None,
+				access_list: Vec::new(),
+				authorization_list: Vec::new(),
+			});
+			let expected_proof_size = proof_size_base_cost
+				+ WRITE_PROOF_SIZE
+				+ IS_EMPTY_CHECK_PROOF_SIZE
+				+ (ACCOUNT_BASIC_PROOF_SIZE * 2);
+
+			assert_eq!(actual_weight.proof_size(), expected_proof_size);
+		});
+	}
 }
 
 mod storage_growth_test {
@@ -2714,7 +3009,9 @@ mod delegation_accounting_test {
 			authorization_list,
 			true, // transactional
 			true, // must be validated
-			Some(FixedGasWeightMapping::<Test>::gas_to_weight(GAS_LIMIT, true)),
+			Some(FixedGasWeightMapping::<Test>::gas_to_weight(
+				GAS_LIMIT, true,
+			)),
 			Some(0),
 			<Test as Config>::config(),
 		)

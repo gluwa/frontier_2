@@ -439,6 +439,34 @@ pub mod pallet {
 		) -> DispatchResultWithPostInfo {
 			T::CallOrigin::ensure_address_origin(&source, origin)?;
 
+			// Must precede `encoded_size`, which traverses the whole authorization list.
+			Self::ensure_authorization_list_size(&authorization_list, || {
+				T::FeeCalculator::min_gas_price().1
+			})
+			.map_err(|e| DispatchErrorWithPostInfo {
+				post_info: PostDispatchInfo {
+					actual_weight: Some(e.weight),
+					pays_fee: Pays::Yes,
+				},
+				error: e.error.into(),
+			})?;
+
+			let (weight_limit, proof_size_base_cost) = Self::call_weight_limits(
+				gas_limit,
+				(
+					&source,
+					&init,
+					&value,
+					&gas_limit,
+					&max_fee_per_gas,
+					&max_priority_fee_per_gas,
+					&nonce,
+					&access_list,
+					&authorization_list,
+				)
+					.encoded_size(),
+			);
+
 			let is_transactional = true;
 			let validate = true;
 			let info = match T::Runner::create(
@@ -453,8 +481,8 @@ pub mod pallet {
 				authorization_list,
 				is_transactional,
 				validate,
-				None,
-				None,
+				weight_limit,
+				proof_size_base_cost,
 				T::config(),
 			) {
 				Ok(info) => info,
@@ -492,10 +520,11 @@ pub mod pallet {
 
 			Ok(PostDispatchInfo {
 				actual_weight: {
-					let mut gas_to_weight = T::GasWeightMapping::gas_to_weight(
-						info.used_gas.standard.unique_saturated_into(),
-						true,
-					);
+					// Charge for the greater of the gas measured by the gasometer and the gas
+					// accounting for external costs (proof size, storage growth).
+					let used_gas = core::cmp::max(info.used_gas.standard, info.used_gas.effective);
+					let mut gas_to_weight =
+						T::GasWeightMapping::gas_to_weight(used_gas.unique_saturated_into(), true);
 					if let Some(weight_info) = info.weight_info {
 						if let Some(proof_size_usage) = weight_info.proof_size_usage {
 							*gas_to_weight.proof_size_mut() = proof_size_usage;
@@ -528,6 +557,35 @@ pub mod pallet {
 		) -> DispatchResultWithPostInfo {
 			T::CallOrigin::ensure_address_origin(&source, origin)?;
 
+			// Must precede `encoded_size`, which traverses the whole authorization list.
+			Self::ensure_authorization_list_size(&authorization_list, || {
+				T::FeeCalculator::min_gas_price().1
+			})
+			.map_err(|e| DispatchErrorWithPostInfo {
+				post_info: PostDispatchInfo {
+					actual_weight: Some(e.weight),
+					pays_fee: Pays::Yes,
+				},
+				error: e.error.into(),
+			})?;
+
+			let (weight_limit, proof_size_base_cost) = Self::call_weight_limits(
+				gas_limit,
+				(
+					&source,
+					&init,
+					&salt,
+					&value,
+					&gas_limit,
+					&max_fee_per_gas,
+					&max_priority_fee_per_gas,
+					&nonce,
+					&access_list,
+					&authorization_list,
+				)
+					.encoded_size(),
+			);
+
 			let is_transactional = true;
 			let validate = true;
 			let info = match T::Runner::create2(
@@ -543,8 +601,8 @@ pub mod pallet {
 				authorization_list,
 				is_transactional,
 				validate,
-				None,
-				None,
+				weight_limit,
+				proof_size_base_cost,
 				T::config(),
 			) {
 				Ok(info) => info,
@@ -582,10 +640,11 @@ pub mod pallet {
 
 			Ok(PostDispatchInfo {
 				actual_weight: {
-					let mut gas_to_weight = T::GasWeightMapping::gas_to_weight(
-						info.used_gas.standard.unique_saturated_into(),
-						true,
-					);
+					// Charge for the greater of the gas measured by the gasometer and the gas
+					// accounting for external costs (proof size, storage growth).
+					let used_gas = core::cmp::max(info.used_gas.standard, info.used_gas.effective);
+					let mut gas_to_weight =
+						T::GasWeightMapping::gas_to_weight(used_gas.unique_saturated_into(), true);
 					if let Some(weight_info) = info.weight_info {
 						if let Some(proof_size_usage) = weight_info.proof_size_usage {
 							*gas_to_weight.proof_size_mut() = proof_size_usage;
