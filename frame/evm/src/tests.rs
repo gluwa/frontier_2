@@ -1019,8 +1019,8 @@ mod proof_size_test {
 			.expect("creation is valid without a proof size limit");
 
 			let nonce = EVM::account_basic(&H160::default()).0.nonce;
-			let err = dispatch(init.clone(), U256::zero(), gas_limit)
-				.expect_err("creation is rejected");
+			let err =
+				dispatch(init.clone(), U256::zero(), gas_limit).expect_err("creation is rejected");
 			assert_eq!(err.error, crate::Error::<Test>::GasLimitTooLow.into());
 			// The creation is rejected before any execution, so only the validation is accounted
 			// for, not the weight derived from the gas limit.
