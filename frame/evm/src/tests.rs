@@ -3009,7 +3009,9 @@ mod delegation_accounting_test {
 			authorization_list,
 			true, // transactional
 			true, // must be validated
-			Some(FixedGasWeightMapping::<Test>::gas_to_weight(GAS_LIMIT, true)),
+			Some(FixedGasWeightMapping::<Test>::gas_to_weight(
+				GAS_LIMIT, true,
+			)),
 			Some(0),
 			<Test as Config>::config(),
 		)
