@@ -17,7 +17,11 @@
 
 //! Weights the pallet reserves for its own hooks.
 
-use frame_support::weights::{constants::RocksDbWeight, Weight};
+use core::marker::PhantomData;
+use frame_support::{
+	traits::Get,
+	weights::{constants::RocksDbWeight, Weight},
+};
 
 pub trait WeightInfo {
 	/// `on_finalize` for a block without Ethereum transactions, which
@@ -31,8 +35,17 @@ pub trait WeightInfo {
 	fn on_finalize_base() -> Weight;
 }
 
-/// Upstream's estimate: reading the digest and block number, and writing the
-/// block and the pruned block hash.
+/// Upstream's estimate, priced with the runtime's `DbWeight`: reading the
+/// digest and block number, and writing the block and the pruned block hash.
+pub struct SubstrateWeight<T>(PhantomData<T>);
+
+impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
+	fn on_finalize_base() -> Weight {
+		T::DbWeight::get().reads_writes(2, 2)
+	}
+}
+
+/// The same estimate, priced with `RocksDbWeight`, for tests.
 impl WeightInfo for () {
 	fn on_finalize_base() -> Weight {
 		RocksDbWeight::get().reads_writes(2, 2)
