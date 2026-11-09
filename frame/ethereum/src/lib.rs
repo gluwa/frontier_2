@@ -35,6 +35,7 @@ extern crate alloc;
 mod mock;
 #[cfg(all(feature = "std", test))]
 mod tests;
+pub mod weights;
 
 use alloc::{vec, vec::Vec};
 use core::marker::PhantomData;
@@ -213,6 +214,8 @@ pub mod pallet {
 		type PostLogContent: Get<PostLogContent>;
 		/// The maximum length of the extra data in the Executed event.
 		type ExtraDataLength: Get<u32>;
+		/// Weights the pallet reserves for its own hooks.
+		type EthereumWeightInfo: crate::weights::WeightInfo;
 	}
 
 	pub mod config_preludes {
@@ -236,6 +239,7 @@ pub mod pallet {
 			type StateRoot = IntermediateStateRoot<Self::Version>;
 			type PostLogContent = PostBlockAndTxnHashes;
 			type ExtraDataLength = ConstU32<30>;
+			type EthereumWeightInfo = ();
 		}
 	}
 
@@ -308,12 +312,11 @@ pub mod pallet {
 					weight = weight.saturating_add(r.actual_weight.unwrap_or_default());
 				}
 			}
-			// Account for `on_finalize` weight:
-			//	- read: frame_system::Pallet::<T>::digest()
-			//	- read: frame_system::Pallet::<T>::block_number()
-			//	- write: <Pallet<T>>::store_block()
-			//	- write: <BlockHash<T>>::remove()
-			weight.saturating_add(T::DbWeight::get().reads_writes(2, 2))
+			// Reserve the part of `on_finalize` that every block pays. What each transaction
+			// adds to it is charged through that transaction's gas.
+			weight.saturating_add(
+				<T::EthereumWeightInfo as crate::weights::WeightInfo>::on_finalize_base(),
+			)
 		}
 
 		fn on_runtime_upgrade() -> Weight {

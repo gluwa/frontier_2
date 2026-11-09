@@ -119,7 +119,9 @@ fn pre_log_weight_accounts_for_block_gas_limit_read() {
 			// The block gas limit.
 			.saturating_add(db_weight.reads(1))
 			// `on_finalize`.
-			.saturating_add(db_weight.reads_writes(2, 2));
+			.saturating_add(
+				<<Test as crate::Config>::EthereumWeightInfo as crate::weights::WeightInfo>::on_finalize_base(),
+			);
 		assert_eq!(weight, expected);
 	});
 }
